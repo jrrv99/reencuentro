@@ -1,0 +1,3 @@
+# Herramientas de desarrollo (no van a producción).
+#   .venv/bin/pip install -r requirements-dev.txt
+ruff>=0.6
