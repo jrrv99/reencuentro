@@ -1,0 +1,20 @@
+# Dependencias base de apps/api (plan §14).
+# Reproducible:  python -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# El stack de reconocimiento facial (insightface + onnxruntime) vive aparte en
+# requirements-faces.txt: es pesado y solo lo necesita la app `identidad`, que aún
+# no está construida. Cada app es un módulo independiente (filosofía SiteHub), así
+# que el esqueleto + búsqueda read-only se levanta sin tocar las caras.
+
+Django>=5.2,<5.3  # 5.2 LTS: CompositePrimaryKey (pares_negativos), GeneratedField, db_default
+djangorestframework>=3.15,<3.16
+drf-spectacular>=0.27,<0.29
+django-filter>=24.3
+djangorestframework-simplejwt>=5.3,<5.5
+celery>=5.4,<5.5
+redis>=5.0,<6.0
+psycopg[binary]>=3.2,<3.3
+pgvector>=0.3,<0.5
+django-cors-headers>=4.4
+rapidfuzz>=3.9
+imagehash>=4.3
