@@ -10,7 +10,7 @@ import os
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from ingesta.connectors.consolidador import ingest_file
+from ingesta.connectors.consolidador import IngestaParseError, ingest_file
 from ingesta.models import SyncRun
 
 
@@ -54,10 +54,12 @@ class Command(BaseCommand):
             run.sin_cambio = stats.sin_cambio
             run.omitidos = stats.omitidos
             run.errores = stats.errores
+        except IngestaParseError as exc:
+            run.fallida = True
+            run.error_msg = str(exc)
+            raise CommandError(str(exc)) from exc
         except Exception as exc:
             run.errores += 1
-            run.terminada_at = timezone.now()
-            run.save()
             raise CommandError(f"Ingesta falló: {exc}") from exc
         finally:
             run.terminada_at = timezone.now()

@@ -5,7 +5,7 @@ import os
 from celery import shared_task
 from django.utils import timezone
 
-from ingesta.connectors.consolidador import ingest_file
+from ingesta.connectors.consolidador import IngestaParseError, ingest_file
 from ingesta.models import SyncRun
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,11 @@ def ingesta_consolidador(
         run.sin_cambio = stats.sin_cambio
         run.omitidos = stats.omitidos
         run.errores = stats.errores
+    except IngestaParseError as exc:
+        # Fallo total: el archivo no era JSON válido. Ningún registro fue procesado.
+        run.fallida = True
+        run.error_msg = str(exc)
+        raise
     except Exception:
         logger.exception("ingesta_consolidador falló para archivo=%s", ruta)
         run.errores += 1

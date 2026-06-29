@@ -14,7 +14,13 @@ from pathlib import Path
 
 from django.test import TestCase
 
-from ingesta.connectors.consolidador import compute_content_hash, ingest_file
+from ingesta.connectors.consolidador import (
+    CENTINELAS_CEDULA,
+    IngestaParseError,
+    compute_content_hash,
+    ingest_file,
+    normalizar_centinela,
+)
 from ingesta.models import SyncRun
 from ingesta.tasks import ingesta_consolidador
 from personas.models import RegistroFuente
@@ -218,3 +224,233 @@ class ContentHashTests(TestCase):
     def test_usa_content_hash_del_json_si_existe(self):
         record = {"id": "1", "nombre": "Juan", "content_hash": "abc123"}
         self.assertEqual(compute_content_hash(record), "abc123")
+
+    def test_hash_no_cambia_al_normalizar_centinelas(self):
+        """La limpieza de centinelas ocurre en _map_record, no toca el input del hash."""
+        record = {
+            "id": "1",
+            "fuente": "dtv",
+            "cedula": "No registrado",
+            "nombre": "Test",
+        }
+        hash_antes = compute_content_hash(record)
+        # Simular que _map_record es llamado (normaliza la cédula internamente)
+        from ingesta.connectors.consolidador import _map_record
+        _map_record(record)
+        # El dict original no debe haber sido modificado
+        self.assertEqual(record["cedula"], "No registrado")
+        # El hash sigue siendo el mismo
+        hash_despues = compute_content_hash(record)
+        self.assertEqual(hash_antes, hash_despues)
+
+
+# ---------------------------------------------------------------------------
+# Tests del nuevo fixture: centinelas, es_menor, ubicacion con coma
+# ---------------------------------------------------------------------------
+
+FIXTURE_CENTINELAS = (
+    Path(__file__).parent / "fixtures" / "consolidador_centinelas.json"
+)
+# 5 registros únicos por (fuente, id_origen); el 6º es duplicado del 2º.
+DISTINTOS_CENTINELAS = 5
+
+
+class NormalizarCentinelaTests(TestCase):
+    """normalizar_centinela() — función pura, sin DB."""
+
+    def test_centinela_conocido_devuelve_none(self):
+        for val in ["No registrado", "NO REGISTRADO", "  no registrado  ", "n/a", "N/A",
+                    "na", "desconocido", "sin cedula", "sin cédula", "ninguno", ""]:
+            with self.subTest(val=val):
+                self.assertIsNone(normalizar_centinela(val), f"'{val}' debe → None")
+
+    def test_cedula_real_pasa_intacta(self):
+        for val in ["37099131", "V-12.345.678", "E-81.234.567", "12345678"]:
+            with self.subTest(val=val):
+                self.assertEqual(normalizar_centinela(val), val)
+
+    def test_none_pasa_como_none(self):
+        self.assertIsNone(normalizar_centinela(None))
+
+    def test_centinelas_personalizadas(self):
+        custom = frozenset({"raro"})
+        self.assertIsNone(normalizar_centinela("raro", centinelas=custom))
+        # "no registrado" no es centinela con el set personalizado
+        self.assertEqual(
+            normalizar_centinela("no registrado", centinelas=custom), "no registrado"
+        )
+
+    def test_set_de_centinelas_es_configurable(self):
+        """Verifica que CENTINELAS_CEDULA es la fuente de configuración."""
+        self.assertIn("no registrado", CENTINELAS_CEDULA)
+        self.assertIn("sin cédula", CENTINELAS_CEDULA)
+
+
+class CentinelaDBTests(TestCase):
+    """Centinelas en el flujo real de ingesta → DB."""
+
+    def setUp(self):
+        ingest_file(FIXTURE_CENTINELAS)
+
+    def test_centinela_no_registrado_almacena_none(self):
+        """'No registrado' → cedula=None en DB (no el string)."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        self.assertIsNone(reg.cedula)
+
+    def test_centinela_cedula_norm_vacia(self):
+        """Si cedula=None, cedula_norm generado por DB = ''."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        self.assertEqual(reg.cedula_norm, "")
+
+    def test_centinela_raw_payload_preserva_original(self):
+        """El raw_payload conserva 'No registrado' original — la limpieza no lo toca."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        self.assertEqual(reg.raw_payload["cedula"], "No registrado")
+
+    def test_digitos_sin_prefijo_se_preservan(self):
+        """'37099131' (sin V/E) → cedula='37099131', cedula_norm='37099131'."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="bbb2222222222222222")
+        self.assertEqual(reg.cedula, "37099131")
+        self.assertEqual(reg.cedula_norm, "37099131")
+
+    def test_prefijo_y_puntos_cedula_norm(self):
+        """'V-12.345.678' → cedula_norm='12345678'."""
+        reg = RegistroFuente.objects.get(fuente="vtb", id_origen="ccc3333333333333333")
+        self.assertEqual(reg.cedula, "V-12.345.678")
+        self.assertEqual(reg.cedula_norm, "12345678")
+
+    def test_tres_sin_digitos_tienen_cedula_norm_vacia(self):
+        """Centinela, null, y otro null → cedula_norm vacío en los 3 casos."""
+        centinela = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        nulo = RegistroFuente.objects.get(fuente="vtb", id_origen="ddd4444444444444444")
+        self.assertEqual(centinela.cedula_norm, "")
+        self.assertEqual(nulo.cedula_norm, "")
+        # Los que tienen cédula real sí tienen cedula_norm no vacío.
+        real = RegistroFuente.objects.get(fuente="dtv", id_origen="bbb2222222222222222")
+        self.assertTrue(bool(real.cedula_norm))
+
+
+class EdadYMenorTests(TestCase):
+    def setUp(self):
+        ingest_file(FIXTURE_CENTINELAS)
+
+    def test_edad_null_se_almacena_null(self):
+        """edad=null en JSON → edad=None en DB, no 0 ni False."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        self.assertIsNone(reg.edad)
+
+    def test_edad_numerica_se_preserva(self):
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="bbb2222222222222222")
+        self.assertEqual(reg.edad, 15)
+
+    def test_es_menor_en_raw_payload(self):
+        """es_menor=true (bool) se preserva en raw_payload, no se castea."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="bbb2222222222222222")
+        self.assertIs(reg.raw_payload["es_menor"], True)
+
+    def test_registro_sin_es_menor_no_tiene_el_campo_en_payload(self):
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="aaa1111111111111111")
+        self.assertNotIn("es_menor", reg.raw_payload)
+
+
+class UbicacionConComaTests(TestCase):
+    def setUp(self):
+        ingest_file(FIXTURE_CENTINELAS)
+
+    def test_ubicacion_con_coma_se_preserva_intacta(self):
+        """Sin marcador de rescate: ultima_ubicacion completa va a ubicacion sin truncar."""
+        reg = RegistroFuente.objects.get(fuente="vtb", id_origen="ddd4444444444444444")
+        self.assertEqual(
+            reg.ubicacion,
+            "Conjunto Residencial Las Acacias, La Guaira, Vargas",
+        )
+        self.assertIsNone(reg.descripcion)
+
+    def test_observaciones_tipo_avistamiento_van_a_descripcion(self):
+        """Observaciones largas (claim) se almacenan en descripcion intactas."""
+        reg = RegistroFuente.objects.get(fuente="dtv", id_origen="eee5555555555555555")
+        self.assertIn("Fue visto el 2 de julio", reg.descripcion)
+        self.assertIn("parecía desorientado", reg.descripcion)
+
+
+class IdempotenciaFixturaCentinelasTests(TestCase):
+    def test_primera_corrida_inserta_distintos_y_sin_cambio_duplicado(self):
+        """Primera corrida: 5 insertados (únicos) + 1 sin_cambio (el duplicado interno)."""
+        stats = ingest_file(FIXTURE_CENTINELAS)
+        self.assertEqual(stats.insertados, DISTINTOS_CENTINELAS)
+        self.assertEqual(stats.sin_cambio, 1)
+        self.assertEqual(stats.errores, 0)
+        self.assertEqual(RegistroFuente.objects.count(), DISTINTOS_CENTINELAS)
+
+    def test_segunda_corrida_todo_sin_cambio(self):
+        """Segunda corrida: 0 insertados, 0 actualizados, 6 sin_cambio."""
+        ingest_file(FIXTURE_CENTINELAS)
+        stats = ingest_file(FIXTURE_CENTINELAS)
+        self.assertEqual(stats.insertados, 0)
+        self.assertEqual(stats.actualizados, 0)
+        self.assertEqual(stats.sin_cambio, 6)  # 5 únicos + 1 duplicado
+        self.assertEqual(RegistroFuente.objects.count(), DISTINTOS_CENTINELAS)
+
+
+class JSONInvalidoTests(TestCase):
+    """JSON mal formado → IngestaParseError con posición + SyncRun.fallida=True."""
+
+    def _archivo_invalido(self, contenido: str) -> str:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(contenido)
+        return f.name
+
+    def test_ingest_file_lanza_error_con_posicion(self):
+        path = self._archivo_invalido('[{"id": "1", "fuente": "dtv",}]')  # coma final
+        try:
+            with self.assertRaises(IngestaParseError) as ctx:
+                ingest_file(path)
+            msg = str(ctx.exception)
+            self.assertIn("línea", msg)
+            self.assertIn("columna", msg)
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_ingest_file_no_inserta_nada_antes_de_abortar(self):
+        path = self._archivo_invalido('no es json')
+        try:
+            with self.assertRaises(IngestaParseError):
+                ingest_file(path)
+            self.assertEqual(RegistroFuente.objects.count(), 0)
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_task_marca_syncrun_fallida(self):
+        """ingesta_consolidador marca run.fallida=True y guarda error_msg."""
+        path = self._archivo_invalido('{"esto": "no es array"}')
+        try:
+            with self.assertRaises(IngestaParseError):
+                ingesta_consolidador(archivo=path)
+        finally:
+            import os
+            os.unlink(path)
+
+        run = SyncRun.objects.get()
+        self.assertTrue(run.fallida)
+        self.assertIsNotNone(run.error_msg)
+        self.assertEqual(RegistroFuente.objects.count(), 0)
+
+    def test_task_json_invalido_syncrun_fallida_con_posicion(self):
+        """error_msg del SyncRun incluye información de posición."""
+        path = self._archivo_invalido('[{roto')
+        try:
+            with self.assertRaises(IngestaParseError):
+                ingesta_consolidador(archivo=path)
+        finally:
+            import os
+            os.unlink(path)
+
+        run = SyncRun.objects.get()
+        self.assertTrue(run.fallida)
+        self.assertIn("línea", run.error_msg)

@@ -30,6 +30,10 @@ class SyncRun(models.Model):
     sin_cambio = models.IntegerField(default=0)
     omitidos = models.IntegerField(default=0)
     errores = models.IntegerField(default=0)
+    # True si la corrida abortó por error total (JSON inválido, etc.).
+    # errores > 0 con fallida=False = errores por-registro (la corrida completó).
+    fallida = models.BooleanField(default=False)
+    error_msg = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "ingesta_sync_runs"
