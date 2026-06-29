@@ -46,8 +46,19 @@ class Command(BaseCommand):
         run = SyncRun.objects.create(fuente=fuente, archivo=ruta)
 
         self.stdout.write(f"Procesando {ruta} (fuente={fuente or 'todas'}) …")
+
+        def _progress(s: SyncRun, total: int) -> None:
+            pct = s.leidos * 100 // total
+            self.stdout.write(
+                f"  {s.leidos:>7,}/{total:,} ({pct:>3}%) "
+                f"+{s.insertados} insertados  "
+                f"={s.sin_cambio} sin_cambio  "
+                f"Δ{s.actualizados} actualizados  "
+                f"!{s.errores} errores"
+            )
+
         try:
-            stats = ingest_file(ruta, fuente_filtro=fuente)
+            stats = ingest_file(ruta, fuente_filtro=fuente, on_progress=_progress)
             run.leidos = stats.leidos
             run.insertados = stats.insertados
             run.actualizados = stats.actualizados

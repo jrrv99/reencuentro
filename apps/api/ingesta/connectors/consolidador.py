@@ -147,6 +147,17 @@ def compute_content_hash(record: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _strip_nul(value: Any) -> Any:
+    """Postgres TEXT/JSONB rechaza bytes NUL (\x00). Los elimina recursivamente."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
 def _map_estado(raw: str | None) -> str:
     if not raw:
         return "sin_contacto"
@@ -232,7 +243,7 @@ def _map_record(record: dict[str, Any]) -> dict[str, Any]:
     # El campo queda preservado en raw_payload para consumo posterior.
     _ = tiene_cedula  # evita F841 hasta que se implemente el TODO del CNE
 
-    return {
+    fields: dict[str, Any] = {
         "fuente": record.get("fuente", ""),
         "id_origen": str(record.get("id", "")),
         "tipo": tipo,
@@ -251,6 +262,9 @@ def _map_record(record: dict[str, Any]) -> dict[str, Any]:
         "raw_payload": record,   # original sin modificar: preserva cedula cruda, es_menor, etc.
         "contacto": _build_contacto(record),
     }
+    # NUL bytes en TEXT/JSONB abortan el INSERT. Se limpian aquí, después del hash
+    # (el hash se calculó sobre el crudo original, el invariante se preserva).
+    return _strip_nul(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +272,19 @@ def _map_record(record: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def ingest_file(archivo: str | Path, fuente_filtro: str | None = None) -> RunStats:
+def ingest_file(
+    archivo: str | Path,
+    fuente_filtro: str | None = None,
+    on_progress=None,
+    progress_interval: int = 1000,
+) -> RunStats:
     """Lee un JSON del consolidador y hace UPSERT idempotente a registros_fuente.
 
     Args:
         archivo: Ruta al JSON (array de registros).
         fuente_filtro: Si se pasa, solo procesa registros de esa fuente.
+        on_progress: Callable(stats, total) invocado cada progress_interval registros.
+        progress_interval: Cada cuántos registros llamar on_progress.
 
     Returns:
         RunStats con los contadores de la corrida.
@@ -294,6 +315,7 @@ def ingest_file(archivo: str | Path, fuente_filtro: str | None = None) -> RunSta
     if fuente_filtro:
         records = [r for r in records if r.get("fuente") == fuente_filtro]
 
+    total = len(records)
     for record in records:
         stats.leidos += 1
         try:
@@ -305,6 +327,8 @@ def ingest_file(archivo: str | Path, fuente_filtro: str | None = None) -> RunSta
                 record.get("fuente"),
             )
             stats.errores += 1
+        if on_progress and stats.leidos % progress_interval == 0:
+            on_progress(stats, total)
 
     return stats
 
