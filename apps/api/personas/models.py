@@ -54,6 +54,18 @@ class RegistroFuente(models.Model):
         db_persist=True,
     )
     cedula = models.TextField(null=True, blank=True)
+    # Columna generada STORED: solo dígitos. regexp_replace es IMMUTABLE en Postgres.
+    # Sin unique: la misma cédula puede aparecer en varias fuentes (es el duplicado a detectar).
+    cedula_norm = models.GeneratedField(
+        expression=RegexpReplace(
+            Coalesce("cedula", Value("")),
+            Value(r"\D"),
+            Value(""),
+            Value("g"),
+        ),
+        output_field=models.TextField(),
+        db_persist=True,
+    )
     edad = models.IntegerField(null=True, blank=True)
     sexo = models.TextField(null=True, blank=True)
     zona = models.TextField(null=True, blank=True)
@@ -88,6 +100,9 @@ class RegistroFuente(models.Model):
         db_default=Value(1.0), help_text="baja si vino de extracción LLM"
     )
     raw_payload = models.JSONField(null=True, blank=True)
+    # sha256 del registro crudo (mismas columnas que usa el consolidador, excluyendo
+    # fecha_actualizacion). Permite clasificar sin_cambio/actualizado en cada corrida.
+    content_hash = models.TextField(null=True, blank=True, db_index=False)
     ingested_at = models.DateTimeField(db_default=Now())
 
     class Meta:
@@ -96,12 +111,8 @@ class RegistroFuente(models.Model):
             models.UniqueConstraint(
                 fields=["fuente", "id_origen"], name="uniq_fuente_id_origen"
             ),
-            # unique parcial de cédula (idéntico al plan §3).
-            models.UniqueConstraint(
-                fields=["cedula"],
-                condition=models.Q(cedula__isnull=False),
-                name="idx_rf_cedula",
-            ),
+            # SIN unique sobre cedula: la misma cédula se repite entre fuentes
+            # (ES el duplicado que detectamos) y puede tener typos.
         ]
         indexes = [
             GinIndex(
@@ -110,6 +121,8 @@ class RegistroFuente(models.Model):
                 opclasses=["gin_trgm_ops"],
             ),
             models.Index(name="idx_rf_zona", fields=["zona"]),
+            # btree en cedula_norm para bloqueo de dedup (no unique).
+            models.Index(name="idx_rf_cedula", fields=["cedula_norm"]),
             HnswIndex(
                 name="idx_rf_face",
                 fields=["face_embedding"],
@@ -132,6 +145,16 @@ class PersonaCanonica(models.Model):
     )
     nombre_display = models.TextField(null=True, blank=True)
     cedula = models.TextField(null=True, blank=True)
+    # Estado de la cédula canónica: refleja la matriz cédula×cara (plan §5).
+    cedula_estado = models.TextField(
+        db_default=Value("sin_confirmar"),
+        help_text="confirmada | conflicto | sin_confirmar",
+    )
+    cedula_confirmada_por = models.TextField(
+        null=True,
+        blank=True,
+        help_text="responder | oficial | cne | consenso",
+    )
     zona = models.TextField(null=True, blank=True)
     estado_actual = models.TextField(
         null=True, blank=True, help_text="derivado del claim vigente más confiable"
