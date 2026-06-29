@@ -71,6 +71,7 @@ create table registros_fuente (
   nombre        text,
   nombre_norm   text generated always as (lower(unaccent(regexp_replace(coalesce(nombre,''),'\s+',' ','g')))) stored,
   cedula        text,
+  cedula_norm   text generated always as (regexp_replace(coalesce(cedula,''),'\D','','g')) stored,  -- solo dígitos; para bloqueo fuzzy de cédula cuando NO hay foto
   edad          int,
   sexo          text,
   zona          text,
@@ -90,7 +91,8 @@ create table registros_fuente (
 
 create index idx_rf_nombre on registros_fuente using gin (nombre_norm gin_trgm_ops);
 create index idx_rf_zona   on registros_fuente (zona);
-create unique index idx_rf_cedula on registros_fuente (cedula) where cedula is not null;
+create index idx_rf_cedula on registros_fuente (cedula_norm);            -- NO unique: la cédula se repite entre fuentes (ES el duplicado que detectamos) y es corruptible por typo
+create index idx_rf_cedula_trgm on registros_fuente using gin (cedula_norm gin_trgm_ops);  -- bloqueo fuzzy de cédula (typos, levenshtein ≤1) SOLO cuando no hay foto
 create index idx_rf_face on registros_fuente using hnsw (face_embedding vector_cosine_ops);
 ```
 
@@ -99,7 +101,9 @@ create index idx_rf_face on registros_fuente using hnsw (face_embedding vector_c
 create table personas_canonicas (
   id             uuid primary key default gen_random_uuid(),
   nombre_display text,
-  cedula         text,
+  cedula         text,        -- la cédula "mejor" (confirmada o de consenso); el conjunto de cédulas RECLAMADAS se deriva de los registros_fuente enlazados
+  cedula_estado  text default 'sin_confirmar',  -- confirmada | conflicto | sin_confirmar
+  cedula_confirmada_por text,                   -- responder | oficial | seniat | consenso
   zona           text,
   estado_actual  text,        -- derivado del registro más confiable/reciente
   foto_principal text,
@@ -194,6 +198,8 @@ Cada conector es una **tarea Celery** aislada, con su manejo de errores, que esc
 - **Tier B — Scraping:** sitios sin API → parser por sitio (requests/Playwright). Frágil; se rompe cuando cambian → presupuestar mantenimiento; prioridad = mover a Tier A.
 - **Tier C — Social + LLM:** Instagram/X/Telegram en texto libre → Ollama extrae JSON (`nombre, edad, zona, estado`) → entra con `confianza` baja y bandera de revisión. n8n orquesta el polling.
 
+> **Aparte de la ingesta, una fuente de *verificación*:** el **SENIAT** (portal RIF) no aporta personas desaparecidas — **valida cédulas** (número → nombre asociado). Es el nivel 1 autoritativo del flujo de cédula (§6.1), no un tier de ingesta.
+
 ---
 
 ## 5. Motor de deduplicación (el corazón compartido de todo)
@@ -202,10 +208,25 @@ Corre en Celery cuando entra/cambia un registro. **Es el mismo motor para los 3 
 
 1. **Normalizar:** `unaccent` + minúsculas + colapsar espacios (ya en `nombre_norm`).
 2. **Bloqueo (evita O(n²)):** candidatos = misma `zona` **o** misma cédula **o** nombre trigram-similar. La cara se compara **solo contra ese shortlist**, no contra toda la DB.
-3. **Scoring por par:**
-   - Cédula igual → 1.0 (auto).
-   - Misma foto (`phash` igual) → señal fortísima.
-   - Si no → `score = 0.5·fuzz(nombre) + 0.2·edad(±3) + 0.2·(zona) + 0.1·(1 − dist_cara)`
+3. **Scoring por par:** la cédula entra por **similitud, no por igualdad**, y con **detección de conflicto** (ver matriz). No es una clave dura: es la señal de mayor peso, pero **corruptible por typo** (en el caos anotan `10.679.876` cuando era `10.679.866`). Cédula y cara **se corroboran mutuamente**; ninguna pisa a la otra de forma automática.
+   - Misma foto (`phash` igual) → señal fortísima (co-localiza los registros en el shortlist).
+   - Base sin cédula → `score = 0.5·fuzz(nombre) + 0.2·edad(±3) + 0.2·(zona) + 0.1·(1 − dist_cara)`
+   - La cédula **modula** esa base según la **matriz cédula × cara**:
+
+   | Cédula | Cara | Resultado |
+   |---|---|---|
+   | igual | coincide | **fusión**, confianza alta |
+   | igual | NO coincide | **colisión por typo** → revisión, **NO fusionar** |
+   | igual | sin foto | fusión (como hoy) |
+   | ≈igual (lev ≤2) | coincide | fusión + marcar cédula **"en conflicto, confirmar"** |
+   | ≈igual (lev ≤2) | NO coincide | personas **distintas** |
+   | ≈igual (lev ≤2) | sin foto | **revisión** |
+   | distinta | coincide | **revisión** (¿error total o sosias?) |
+   | distinta | NO coincide | personas **distintas** |
+   | distinta | sin foto | fuzzy normal de nombre/zona |
+
+   > El **bloqueo fuzzy de cédula** (levenshtein ≤1, índice `idx_rf_cedula_trgm`) **solo hace falta cuando no hay foto.** Con foto, el `phash` idéntico ya co-localiza los registros en el mismo shortlist y el typo se detecta en la **comparación por par** — sin necesidad de un índice global de cédulas.
+
 4. **Umbrales:**
    - alto → link/merge,
    - medio → **cola de revisión** (Ollama puede pre-opinar),
@@ -235,6 +256,22 @@ Para quien **registra directo en el hub**. Patrón estilo Google Person Finder: 
 - Amigo sube **otra foto** de la misma persona → embedding de cara → candidato a revisión.
 
 **Umbral generoso aquí:** como hay un humano decidiendo en el acto, se muestran más candidatos (más recall). Mostrar uno de más es gratis. El umbral conservador se reserva para el merge automático de la data ingerida.
+
+### 6.1 — Confirmación y conflicto de cédula (la cédula es corruptible)
+
+La cédula es la señal más fuerte, pero un typo en el caos la vuelve veneno si se trata como verdad firme. Mientras un conflicto no se resuelve, la persona queda **buscable por TODAS las cédulas reclamadas** (la correcta y la del typo) y la cédula se muestra como **"(por confirmar)"**, nunca como dato firme. El conflicto entra a la cola de revisión como ítem **`cedula_conflicto`**.
+
+**Resolución por prioridad:**
+1. **Autoritativa:** un responder con la cédula física en mano, una fuente oficial, o verificación contra **SENIAT** (ver abajo) → fija el número real → `cedula_estado=confirmada`, `cedula_confirmada_por` = `responder` | `oficial` | `seniat`.
+2. **Consenso entre fuentes:** si 3 fuentes dicen `…866` y 1 dice `…876`, el outlier es el typo → se **sugiere**, no se sobrescribe en silencio → `cedula_confirmada_por=consenso`.
+3. **Interactivo** (reporte directo en el hub): *"Encontramos a María Pérez con una cédula casi igual (…866). ¿Es la misma persona? ¿Cuál número es el correcto?"*, con opción **"no estoy seguro"**.
+
+**La búsqueda por cédula también es fuzzy** (levenshtein ≤1): tolera el typo tanto en el reporte como en la búsqueda — de nada sirve corregir el ingreso si quien busca también se equivoca un dígito.
+
+#### SENIAT — fuente autoritativa de verificación de cédula
+El **portal RIF del SENIAT**, dado un número de cédula, devuelve el **nombre asociado** → confirma identidad o **detecta el typo** (si el nombre no coincide, o el número no existe). Es el **nivel 1 "autoritativo"** de la matriz §5.
+
+> **Viabilidad:** probablemente **no hay API oficial** y hoy se consulta a mano. Va como paso **semi-manual** (un moderador/responder confirma contra el portal). **TODO:** investigar si es consultable programáticamente (y con qué límites/legalidad).
 
 ---
 
@@ -293,7 +330,7 @@ Arrancar permisivo para **captura** las primeras horas; `fallecido` **siempre** 
 ### Parte B — Cómo registra (el doctor con 30 pacientes)
 Rápido y **tolerante a offline** (el wifi del hospital se cae). Por paciente:
 1. **Identificar** en orden de preferencia:
-   - **Cédula** (rápido y exacto) → match exacto.
+   - **Cédula** (rápida y de máximo peso) → match por cédula **con tolerancia a typo** (§6.1); no es clave dura.
    - **Nombre** (si está consciente) → texto.
    - **Cara** (solo inconsciente sin documentos) → top-K para confirmar visual. La cara es **último recurso** → minimiza uso del dato biométrico.
 2. **Confirmar**: elige del shortlist o marca **"no identificado"**.
@@ -315,6 +352,7 @@ El **"no identificado"** entra al índice con su foto/embedding y **se cruza aut
 
 **Bootstrapping de instituciones (no una por una en frío):**
 - **Ancla humanitaria:** enchufarse a un partner creíble (Cruz Roja / su programa de Restablecimiento del Contacto entre Familiares). Ellos validan su red y tú **heredas** esa confianza. Resuelve el grueso con una sola alianza.
+- **Equipos ciudadanos que ya agregan a mano** (ver §13): revisan las fuentes una por una y verifican cédulas contra el SENIAT en un Google Sheet. Son ancla de validación y dataset semilla limpio; **aliarse antes que duplicar** su trabajo.
 - **Lista pública finita:** los hospitales de Carabobo, La Guaira, Caracas y Aragua son decenas, no miles, y son conocidos. Pre-cargarlos desde data pública; el resto entra provisional.
 - **Dominio de correo institucional + llamada al número público** del hospital para confirmar al admin.
 - **Cross-vouch:** una institución verificada avala a otra.
@@ -371,7 +409,7 @@ Ese es el momento para el que existe toda la plataforma.
 
 **Fase 0 — Días (resuelve ~70% del dolor):** esquema canónico + conectores de las 2 fuentes grandes (scraping si no cooperan) + dedup por cédula y fuzzy de texto + buscador unificado read-only con link-back.
 
-**Fase 1:** capa de foto (pHash + embeddings InsightFace/pgvector) + Sistema 1 interactivo + cola de revisión + Cloudflare cache + conector social con Ollama.
+**Fase 1:** capa de foto (pHash + embeddings InsightFace/pgvector) + Sistema 1 interactivo + cola de revisión + **verificación SENIAT y manejo de conflicto de cédula** (matriz cédula × cara §5, flujo §6.1, búsqueda fuzzy por cédula) + Cloudflare cache + conector social con Ollama.
 
 **Fase 2:** Sistema 3 (responders/instituciones + captura + notificación) + Sistema 2 (búsqueda inversa por cara) + admin de merge/split + pitch de cooperación + formato compartido (PFIF) + tolerancia offline.
 
@@ -383,6 +421,16 @@ Mensaje a los dueños de las 2–3 plataformas grandes:
 > *"Monto un meta-buscador neutral que **enlaza de vuelta a ustedes y les manda tráfico**, no los reemplaza. Solo necesito un export read-only (CSV/JSON) o permiso para indexar. El dedup entre fuentes nos ayuda a todos."*
 
 Énfasis: link-back, crédito, sin monetización, no oficial. Eso baja la resistencia.
+
+### Ancla humanitaria: los equipos que ya agregan a mano
+Existen **equipos ciudadanos que ya hacen esto manualmente:** revisan **Venezuelatebusca**, **hospitalesenvenezuela** y **reddeemergencia** una por una, **verifican cédulas contra el SENIAT** y vuelcan todo a un **Google Sheet**. Hacen a pulso exactamente lo que este hub automatiza.
+
+Son el **primer aliado** y la **ancla humanitaria** (ver §8 Parte D):
+- Su **Google Sheet curado = dataset semilla limpio** — mejor que scrapear.
+- Su **juicio sobre fuentes** es valioso (ya marcan `reddeemergencia` como "no muy confiable").
+- Pueden ser **moderadoras / partner de validación**.
+
+**Estrategia: aliarse, no competir ni construir en paralelo.** Se les ofrece dejar de copiar-pegar a mano a cambio de su curaduría y criterio.
 
 ---
 
@@ -442,3 +490,5 @@ Obligatorio: `django-filter` + paginación, CORS, throttling DRF **y** Cloudflar
 
 ### Estado del diseño
 **Cerrado de punta a punta.** Ingesta híbrida, dedup entre fuentes, los 3 sistemas de identidad, el modelo multi-workspace para instituciones, y el loop de notificación. Listo para empezar a construir por la Fase 0.
+
+> **Revisión — cédula corruptible + SENIAT:** la cédula se degradó de **clave dura** (índice único / fusión automática) a **señal de máximo peso con guardia de corroboración**: scoring por similitud + matriz cédula × cara (§5), flujo de confirmación y conflicto (§6.1), verificación contra **SENIAT**, y búsqueda fuzzy por cédula. Cédula y rostro se corroboran mutuamente; ninguno pisa al otro de forma automática. Se sumaron los **equipos ciudadanos que ya agregan a mano** como ancla humanitaria (§13). La verificación SENIAT y el manejo de conflicto de cédula van en **Fase 1** (§12).
