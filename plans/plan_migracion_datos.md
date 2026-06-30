@@ -134,33 +134,26 @@ El serializer público **nunca** expone los campos privados (§3). Filtrado por 
 
 ## 7. Orden de ejecución
 
-0. **Local listo:** `infra/` con `pgvector/pgvector:pg17`; conseguir una muestra del XLSX (~2k filas, anonimizada).
-1. **Migraciones:** reconciliar cédula en los modelos §3 (quitar unique, agregar `cedula_norm`, `cedula_estado`, `cedula_confirmada_por`) + crear canónicas. Todas CreateModel normales.
-2. **Verificar la clave de idempotencia** (¿`ID` del XLSX estable?) y si `personas` tiene data interna no presente en el XLSX.
-3. **App `ingesta`:** conector `ingesta_xlsx` con mapeo + limpieza + upsert idempotente (§3.1). Backfill interno único si aplica (§3.2).
-4. **Cargar la muestra** → poblar `registros_fuente`; correr 2x para confirmar 0 duplicados.
-5. **Motor de dedup (Hito 2):** construir `personas_canonicas` + `cluster_links`.
-6. **Servicio CNE** como señal (§5).
-7. **Validar en local con volumen**, luego prod en ventana coordinada.
-8. **Corte:** el bot pasa a consumir tu nueva API; `personas` deja de consumirse (no se borra).
+0. ✅ **Local listo:** `infra/` con `pgvector/pgvector:pg16`; JSON del consolidador.
+1. ✅ **Migraciones:** reconciliar cédula en los modelos §3 (quitar unique, agregar `cedula_norm`, `cedula_estado`, `cedula_confirmada_por`) + crear canónicas. Todas CreateModel normales.
+2. ✅ **Verificar la clave de idempotencia** (`ID` del consolidador es estable) + `personas` queda legacy sin backfill.
+3. ✅ **App `ingesta`:** conector idempotente del consolidador + `SyncRun`.
+4. ✅ **Cargar el JSON** → 56k registros en local; idempotencia confirmada (segunda corrida = sin_cambio).
+5. **APIs + Admin (Hito 2a):** `bootstrap_canonicas` + ViewSets + Django Admin.
+6. **Instituciones (Hito 3):** modelos + JWT + workspaces + admin de hospitales.
+7. **Motor de dedup (Hito 2b):** construir `personas_canonicas` + `cluster_links` vía Celery.
+8. **Servicio CNE** como señal (§5) — requiere token de `ve-cedula-service`.
+9. **Validar en local con volumen**, luego prod en ventana coordinada.
+10. **Corte:** el bot pasa a consumir tu nueva API; `personas` deja de consumirse (no se borra).
 
 ---
 
 ## 8. Hilos abiertos
 
 - ✅ **`id` confirmado estable y determinístico** (derivado del id de la fuente). Clave: `(fuente, id_origen)` como TEXT.
-- **¿Consumir el delta del consolidador hacia tu API** (reemplazando el upload al PHP) o seguir recibiendo el JSON/XLSX en paralelo durante la coexistencia? (define el corte).
-- **¿`personas` tiene data interna fuera del feed del consolidador?** (estados del bot, correcciones) → define si hay backfill único.
+- ✅ **`personas` legacy:** se deja intacta sirviendo al bot; no hay backfill.
+- **¿Consumir el delta del consolidador hacia tu API** (reemplazando el upload al PHP) o seguir recibiendo el JSON completo? (define el corte).
 - **Seguridad:** anon key de Supabase hardcodeado en `chiki/scraper.py` (repo público) → mover a env y rotar; avisar al equipo.
 - Token y dueño del `ve-cedula-service` (CNE).
-- Tuning de Postgres local para los 240k (shared_buffers/work_mem; índices al final del backfill).
+- Tuning de Postgres para los 240k (shared_buffers/work_mem; índices al final del backfill).
 - Quién y cuándo activa el feature flag del corte del bot.
-
----
-
-## 8. Hilos abiertos
-
-- Token y dueño del `ve-cedula-service` (CNE).
-- ¿El worker PHP empezará a setear `fuente`/`id_origen` para procedencia hacia adelante? (parche mínimo opcional; no bloquea.)
-- Tuning de Postgres local para los 240k (shared_buffers/work_mem; índices al final del backfill).
-- Cuándo y quién corta las lecturas del bot a canónicas (feature flag).

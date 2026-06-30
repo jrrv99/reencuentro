@@ -405,13 +405,36 @@ Ese es el momento para el que existe toda la plataforma.
 
 ---
 
-## 12. Plan por fases
+## 12. Plan por fases e hitos
 
-**Fase 0 — Días (resuelve ~70% del dolor):** esquema canónico + conectores de las 2 fuentes grandes (scraping si no cooperan) + dedup por cédula y fuzzy de texto + buscador unificado read-only con link-back.
+### Scope de equipo (decisiones tomadas)
 
-**Fase 1:** capa de foto (pHash + embeddings InsightFace/pgvector) + Sistema 1 interactivo + cola de revisión + **verificación SENIAT y manejo de conflicto de cédula** (matriz cédula × cara §5, flujo §6.1, búsqueda fuzzy por cédula) + Cloudflare cache + conector social con Ollama.
+| Hito | Contenido | Responsable | Estado | Estimado |
+|---|---|---|---|---|
+| 0 | Esqueleto monorepo + infra Docker | Claude Code | ✅ | — |
+| 1 | Modelos `personas` + conector ingesta consolidador + 56k registros | Claude Code | ✅ | — |
+| 2a | APIs públicas (`personas/`, `registros/`) + Django Admin | Claude Code | 🔄 en curso | ~1 sesión |
+| 2b | Motor de dedup (blocking + scoring + union-find + Celery) | Claude Code | pendiente | ~1.5–2 sesiones |
+| 3 | Instituciones / Responders + JWT + workspaces + admin hospitales | Claude Code | pendiente | ~1–1.5 sesiones |
+| 4 | Stack de caras (InsightFace + pgvector + búsqueda inversa) | Ricardo | diferido | — |
+| 5 | Frontend Next.js (buscador público + app responders) | Equipo externo | fuera de scope | — |
 
-**Fase 2:** Sistema 3 (responders/instituciones + captura + notificación) + Sistema 2 (búsqueda inversa por cara) + admin de merge/split + pitch de cooperación + formato compartido (PFIF) + tolerancia offline.
+> **Hito 4:** la arquitectura está lista (`face_embedding vector(512)`, índice HNSW, `foto_phash`). Ricardo lo integra cuando tenga GPU/token. No bloquea ningún otro hito.
+> **Hito 5:** el equipo de frontend consume la API v1 del Hito 2a. Contrato: endpoints de §14.
+
+### Orden dentro de Fase 0 (ya en ejecución)
+
+**Fase 0 — resuelve ~70% del dolor:** esquema canónico + conector consolidador + dedup por cédula y fuzzy de texto + buscador unificado read-only con link-back.
+
+Secuencia real de construcción:
+1. ✅ Infra + modelos + ingesta (Hitos 0–1)
+2. 🔄 APIs + Admin (Hito 2a) — el frontend externo ya puede consumir
+3. Instituciones + responders (Hito 3) — hospitales cargables desde el admin
+4. Motor de dedup (Hito 2b) — fusiona los 56k en canónicas reales
+
+**Fase 1:** verificación CNE/SENIAT + conflicto de cédula (§6.1) + cola de revisión + Cloudflare cache + conector social con Ollama.
+
+**Fase 2 (cuando Ricardo integre Hito 4):** Sistema 2 (búsqueda inversa por cara) + Sistema 1 interactivo con foto + admin de merge/split + tolerancia offline.
 
 ---
 
@@ -488,7 +511,89 @@ Obligatorio: `django-filter` + paginación, CORS, throttling DRF **y** Cloudflar
 
 ---
 
-### Estado del diseño
-**Cerrado de punta a punta.** Ingesta híbrida, dedup entre fuentes, los 3 sistemas de identidad, el modelo multi-workspace para instituciones, y el loop de notificación. Listo para empezar a construir por la Fase 0.
+## 15. Convenciones de API (Hito 2a — contrato con el frontend)
 
-> **Revisión — cédula corruptible + SENIAT:** la cédula se degradó de **clave dura** (índice único / fusión automática) a **señal de máximo peso con guardia de corroboración**: scoring por similitud + matriz cédula × cara (§5), flujo de confirmación y conflicto (§6.1), verificación contra **SENIAT**, y búsqueda fuzzy por cédula. Cédula y rostro se corroboran mutuamente; ninguno pisa al otro de forma automática. Se sumaron los **equipos ciudadanos que ya agregan a mano** como ancla humanitaria (§13). La verificación SENIAT y el manejo de conflicto de cédula van en **Fase 1** (§12).
+### Endpoints Fase 0
+
+| Método | URL | Descripción |
+|---|---|---|
+| `GET` | `/api/v1/personas/` | Lista pública de `personas_canonicas` (paginada, filtrable) |
+| `GET` | `/api/v1/personas/{id}/` | Detalle de canónica + registros fuente expandidos inline |
+| `GET` | `/api/v1/registros/` | Lista de `registros_fuente` (filtrable; para admin/debug) |
+| `GET` | `/api/v1/registros/{id}/` | Detalle de registro fuente + link a su canónica |
+
+Solo lectura en Fase 0. Escritura (reportes, encontrados) va en Fase 1.
+
+### ViewSets — patrón obligatorio
+
+`ReadOnlyModelViewSet`. `get_serializer_class` elige entre lista y detalle:
+
+```python
+def get_serializer_class(self):
+    if self.action == "retrieve":
+        return MiRecursoDetailSerializer
+    return MiRecursoSerializer
+```
+
+### Serializers — lista / detalle
+
+Base `HyperlinkedModelSerializer`. En lista las relaciones son URLs (`HyperlinkedRelatedField`). En detalle `to_representation` las expande inline:
+
+```python
+class PersonaCanonicaDetailSerializer(PersonaCanonicaSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        registros_qs = instance.cluster_links.select_related("registro")
+        data["registros"] = RegistroFuenteSerializer(
+            [cl.registro for cl in registros_qs],
+            many=True, context=self.context,
+        ).data
+        return data
+```
+
+### Privacidad — allow-list estricta (línea roja)
+
+`contacto`, `face_embedding`, `raw_payload`, `cedula` cruda y datos de responder **nunca** en serializers públicos. La allow-list está en `fields = [...]` del Meta — si el campo no está en `fields`, no existe. Nunca filtrar con `if`.
+
+```python
+PUBLIC_REGISTRO_FIELDS = [
+    "url", "fuente", "url_origen", "tipo", "nombre",
+    "edad", "sexo", "zona", "ubicacion", "descripcion",
+    "foto_url", "estado_rep", "tipo_fuente", "confianza", "ingested_at",
+]
+```
+
+### Filtros
+
+`django-filter` + `SearchFilter` + `OrderingFilter` en ambos ViewSets. Búsqueda por nombre: `__unaccent__icontains`.
+
+### Bootstrap pre-dedup
+
+El comando `bootstrap_canonicas` crea una `PersonaCanonica` 1-a-1 por cada `RegistroFuente` sin cluster, con su `ClusterLink`. El Hito 2b (dedup) fusiona/consolida encima sin destruir nada.
+
+---
+
+## 16. Interoperabilidad — perfil PFIF-JSON
+
+Existe un contrato abierto (`SoltanDev/pfif-json-vzla`, v0.1.0) que define un perfil de **PFIF 1.4 sobre JSON** para que las plataformas de desaparecidos en Venezuela se exporten data entre sí. Es la materialización del "formato compartido" de §13. **Postura a adoptar: interoperabilidad, no solo consolidación** — el hub no debe ser punto único de fallo; debe *exponer* este contrato, no solo consumir.
+
+**Valida el diseño** (coincidencias 1:1): persona + notas append-only = `personas_canonicas` + `estado_claims`; recencia por `source_date` = puente `tipo_fuente`+recencia; `person_record_id = dominio/id_local` = `(fuente, id_origen)`; "derivar nota sintética al exportar" = puente `estado_actual`→claims.
+
+**Dos direcciones de uso:**
+- **Consumir:** si las otras plataformas exponen PFIF-JSON, la ingesta Tier-A deja de ser scraping a medida → sync incremental con `updated_since` + `cursor`. Sin parser a medida por sitio.
+- **Exponer:** la API pública (§14, `GET /api/v1/export?format=pfif`) sirve el contrato PFIF → el bot y otros agregadores consumen la canónica deduplicada. No-SPOF, ecosistema federado.
+
+**Refinamientos a incorporar al modelo:**
+- **`cedula_hash`** (SHA-256 con salt compartido) en el **export**, nunca la cédula en claro. La cédula cruda se queda interna (CNE, matriz §5). Caveat: cédula ~8 dígitos → el salt es la única protección real; custodiarlo y decidir quién lo tiene.
+- **`expiry_date` / retención** — fecha tras la cual el registro se elimina. **Hueco actual del plan:** adoptarlo para cumplir con retención de PII de gente vulnerable post-emergencia.
+- **Redacción de menores** en acceso público + `expiry_date` obligatorio para menores (formaliza `es_menor`).
+- **Mapeo de enum al exportar:** el enum interno (más rico: `hospitalizado`, `refugiado`, etc.) → los 5 valores PFIF; `hospitalizado`/`refugiado` → `believed_alive` con el matiz en el texto de la nota.
+
+**Jugada de cooperación:** el estándar es v0.1.0, abierto a PRs. Ser early-adopter / co-autor da voz en el estándar y acelera la adopción por las demás plataformas venezolanas.
+
+---
+
+### Estado del diseño
+**Cerrado de punta a punta.** Ingesta híbrida, dedup entre fuentes, los 3 sistemas de identidad, el modelo multi-workspace para instituciones, el loop de notificación, y el perfil de interoperabilidad PFIF-JSON (§16). Listo para construir por Fase 0.
+
+> **Revisión — cédula corruptible + SENIAT:** la cédula se degradó de **clave dura** a **señal de máximo peso con guardia de corroboración**: scoring por similitud + matriz cédula × cara (§5), flujo de confirmación y conflicto (§6.1), verificación contra **SENIAT**, búsqueda fuzzy por cédula. Cédula y rostro se corroboran mutuamente; ninguno pisa al otro de forma automática. Verificación SENIAT y manejo de conflicto de cédula van en **Fase 1** (§12).
