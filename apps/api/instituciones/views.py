@@ -14,6 +14,7 @@ from rest_framework import filters, serializers, status, viewsets
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 
+from personas.choices import AutorTipo
 from personas.models import EstadoClaim, PersonaCanonica
 
 from .models import Institucion, Responder
@@ -153,18 +154,15 @@ class EstadoClaimViewSet(viewsets.GenericViewSet,
         return [IsAuthenticated(), IsResponderActivo()]
 
     def create(self, request, *args, **kwargs):
-        write_ser = self.get_serializer(data=request.data)
-        write_ser.is_valid(raise_exception=True)
-
-        # Gate fallecido: requiere institución verificada
-        estado = write_ser.validated_data.get("estado")
-        if estado == "fallecido":
+        # Gate fallecido ANTES de validar el serializer: 403 (autorización) > 400 (validación)
+        from personas.choices import EstadoRep
+        if request.data.get("estado") == EstadoRep.FALLECIDO:
             perm = IsInstitucionVerificada()
             if not perm.has_permission(request, self):
-                return Response(
-                    {"detail": perm.message}, status=status.HTTP_403_FORBIDDEN
-                )
+                return Response({"detail": perm.message}, status=status.HTTP_403_FORBIDDEN)
 
+        write_ser = self.get_serializer(data=request.data)
+        write_ser.is_valid(raise_exception=True)
         self.perform_create(write_ser)
         read_ser = EstadoClaimSerializer(
             write_ser.instance, context=self.get_serializer_context()
@@ -175,8 +173,8 @@ class EstadoClaimViewSet(viewsets.GenericViewSet,
     def perform_create(self, serializer):
         responder = self.request.user.responder
         claim = serializer.save(
-            autor_tipo="responder",
-            autor_id=responder.id,
+            autor_tipo=AutorTipo.RESPONDER,
+            autor_responder=responder,
             vigente=True,
         )
         # Actualiza estado_actual de la canónica

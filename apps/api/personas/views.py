@@ -17,6 +17,7 @@ from rest_framework import filters, status, viewsets
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from .choices import TipoFuente
 from .filters import PersonaCanonicaFilter, RegistroFuenteFilter
 from .models import ClusterLink, PersonaCanonica, RegistroFuente
 from .serializers import (
@@ -144,8 +145,11 @@ class RegistroFuenteViewSet(viewsets.ModelViewSet):
         confianza = 0.9 if institucion.verificada else 0.7
         tipo_fuente = (
             institucion.tipo
-            if institucion.tipo in ("hospital", "clinica", "oficial", "partner")
-            else "rescatista"
+            if institucion.tipo in (
+                TipoFuente.HOSPITAL, TipoFuente.CLINICA,
+                TipoFuente.OFICIAL, TipoFuente.PARTNER,
+            )
+            else TipoFuente.RESCATISTA
         )
         registro = serializer.save(
             fuente=institucion.fuente_slug,

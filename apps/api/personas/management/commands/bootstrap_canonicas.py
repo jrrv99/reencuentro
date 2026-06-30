@@ -16,6 +16,7 @@ from collections import defaultdict
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
+from personas.choices import MetodoCluster
 from personas.models import ClusterLink, PersonaCanonica, RegistroFuente
 
 
@@ -95,7 +96,7 @@ class Command(BaseCommand):
                             registro_id=r["id"],
                             persona=persona,
                             score=1.0,
-                            metodo="cedula",
+                            metodo=MetodoCluster.CEDULA,
                             confirmado=True,
                         )
                         for r in grupo
@@ -131,7 +132,7 @@ class Command(BaseCommand):
                         registro=registro,
                         persona=persona,
                         score=1.0,
-                        metodo="bootstrap",
+                        metodo=MetodoCluster.BOOTSTRAP,
                         confirmado=True,
                     )
                     creadas_fase2 += 1

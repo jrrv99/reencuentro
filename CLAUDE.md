@@ -7,14 +7,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Fase 0 — en curso.** Hitos completados:
 - Esqueleto del monorepo (`apps/api/` Django + `config/` + 5 apps registradas)
 - `infra/` compose completo: Postgres+pgvector, Redis, **y el servicio `api` Django**
-- App `personas`: modelos del plan §3 (con `nombre_norm`/`cedula_norm` generados, índices GIN-trigram, HNSW, partial-unique), migraciones 0001–0003 (extensiones, esquema, reconciliación de cédula)
+- App `personas`: modelos del plan §3 (con `nombre_norm`/`cedula_norm` generados, índices GIN-trigram, HNSW, partial-unique), migraciones 0001–0005
 - App `ingesta`: conector idempotente del consolidador (upsert sobre `(fuente, id_origen)`, `content_hash`, centinelas de cédula, parseo no-silencioso, `SyncRun`)
 - **56k registros reales cargados en local** vía `ingesta_consolidador`
-- `GET /api/v1/personas/` funcional (buscador público, privacy-filtered, `PersonaCanonicaViewSet`)
+- APIs públicas completas: `PersonaCanonicaViewSet` + `RegistroFuenteViewSet` (lista/detalle, HyperlinkedModelSerializer, filtros, inline expansion)
+- Motor de dedup (Hito 2b): blocking, scoring, union-find, Celery tasks, `dedup_backfill`
+- App `instituciones` (Hito 3): `Institucion`, `Responder`, `EstadoClaim` (FK explícitos), CRUD completo con permisos por anillo
 
-**En construcción ahora:** ViewSet APIs completas — `RegistroFuenteViewSet` + refactor a `HyperlinkedModelSerializer` con expansión inline en detalle (plan §9).
+**Pendiente:** stack de caras (`identidad`, Hito 4 — necesita GPU), frontend Next.js.
 
-**Pendiente:** motor de dedup (Hito 2b), stack de caras (`identidad`), instituciones/responders, frontend Next.js.
+**El plan es la fuente de verdad** — leerlo antes de construir. `plans/plan_migracion_datos.md` para arquitectura de datos/APIs; `plans/plan_maestro_desaparecidos.md` para el diseño completo del sistema.
 
 **El plan es la fuente de verdad** — leerlo antes de construir. `plans/plan_migracion_datos.md` para arquitectura de datos/APIs; `plans/plan_maestro_desaparecidos.md` para el diseño completo del sistema.
 
@@ -147,6 +149,42 @@ API versionada `/api/v1/` desde el día uno.
 - `registros_fuente.nombre_norm` es una STORED generated column. Postgres exige funciones IMMUTABLE allí; `unaccent()` es STABLE → la migración `personas/0001_extensions.py` crea `immutable_unaccent()`. No reemplazar por `unaccent()` directo o las migraciones se rompen.
 - `cedula_norm` usa `regexp_replace(..., '\D', '', 'g')` que sí es IMMUTABLE en Postgres — sin wrapper.
 
+### Enums / choices — regla obligatoria
+
+**Nunca strings literales para valores de choices.** Siempre usar las clases `TextChoices` del módulo `choices.py` de cada app:
+
+```python
+# Bien
+from personas.choices import MetodoCluster, EstadoRep
+ClusterLink(metodo=MetodoCluster.CEDULA, ...)
+claim.estado == EstadoRep.FALLECIDO
+
+# Mal — string literal, frágil y sin autocomplete
+ClusterLink(metodo="cedula", ...)
+claim.estado == "fallecido"
+```
+
+Los módulos de choices son:
+- `personas/choices.py` — `TipoRegistro`, `EstadoRep`, `TipoFuente`, `CedulaEstado`, `CedulaConfirmadaPor`, `MetodoCluster`, `AutorTipo`
+- `instituciones/choices.py` — `TipoInstitucion`, `RolResponder`
+
+### FKs polimórficos — FK explícito + discriminador, no GenericForeignKey
+
+Cuando un campo puede apuntar a distintos modelos según contexto, usar **FK explícitas nullable + campo discriminador** en vez de `ContentType` + `GenericForeignKey`:
+
+```python
+# Bien — legible, queryable, admin-friendly
+autor_tipo      = models.TextField(choices=AutorTipo.choices, ...)
+autor_responder = models.ForeignKey("instituciones.Responder", null=True, blank=True, ...)
+autor_registro  = models.ForeignKey(RegistroFuente,           null=True, blank=True, ...)
+# autor_tipo discrimina cuál FK está poblado; el otro queda null
+
+# Mal — opaco, requiere join por ContentType, Django admin no lo soporta bien
+content_type = models.ForeignKey(ContentType, ...)
+object_id    = models.UUIDField(...)
+autor        = GenericForeignKey("content_type", "object_id")
+```
+
 ---
 
 ## Commands
@@ -183,7 +221,11 @@ apps/api/.venv/bin/python manage.py makemigrations --check --dry-run
 
 **URLs clave** (bajo `/api/v1/`):
 - `personas/` — buscador público
-- `registros/` — registros fuente (en construcción)
+- `registros/` — registros fuente (GET público, POST para responders)
+- `instituciones/` — hospitales/orgs (GET público, write solo staff)
+- `responders/` — miembros de workspace (JWT)
+- `claims/` — estados de personas (GET público, POST para responders)
+- `auth/token/` — JWT login (responders)
 - `schema/` — OpenAPI JSON
 - `docs/` — Swagger UI
 - `redoc/` — ReDoc

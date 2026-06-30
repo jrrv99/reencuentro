@@ -15,6 +15,7 @@ Umbrales:
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
 
+from personas.choices import MetodoCluster
 from personas.models import RegistroFuente
 
 UMBRAL_MERGE = 0.85
@@ -34,18 +35,18 @@ def score_par(a: RegistroFuente, b: RegistroFuente) -> tuple[float, str]:
 
         if lev == 0:
             # igual + sin foto → fusión
-            return 1.0, "cedula"
+            return 1.0, MetodoCluster.CEDULA
 
         if lev <= 2:
             # ≈igual + sin foto → revisión (no merge automático)
             base = _score_base(a, b)
-            return max(base, UMBRAL_REVISION), "fuzzy"
+            return max(base, UMBRAL_REVISION), MetodoCluster.FUZZY
 
         # distinta + sin foto → fuzzy normal, penalizado
-        return _score_base(a, b) * 0.8, "fuzzy"
+        return _score_base(a, b) * 0.8, MetodoCluster.FUZZY
 
     # Sin cédula en alguno → fuzzy puro de nombre/edad/zona
-    return _score_base(a, b), "fuzzy"
+    return _score_base(a, b), MetodoCluster.FUZZY
 
 
 # ---------------------------------------------------------------------------

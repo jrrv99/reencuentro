@@ -16,6 +16,15 @@ from django.db.models import Value
 from django.db.models.functions import Coalesce, Lower, Now
 from pgvector.django import HnswIndex, VectorField
 
+from .choices import (
+    AutorTipo,
+    CedulaConfirmadaPor,
+    CedulaEstado,
+    EstadoRep,
+    MetodoCluster,
+    TipoFuente,
+    TipoRegistro,
+)
 from .functions import GenRandomUUID, ImmutableUnaccent, RegexpReplace
 
 
@@ -25,7 +34,7 @@ class RegistroFuente(models.Model):
     id = models.UUIDField(
         primary_key=True, db_default=GenRandomUUID(), editable=False
     )
-    tipo = models.TextField(help_text="'buscado' | 'encontrado'")
+    tipo = models.TextField(choices=TipoRegistro.choices)
     identificado = models.BooleanField(
         db_default=Value(True), help_text="false = encontrado sin identificar"
     )
@@ -83,9 +92,7 @@ class RegistroFuente(models.Model):
         help_text="InsightFace: detecta MISMA persona en otra foto",
     )
     estado_rep = models.TextField(
-        null=True,
-        blank=True,
-        help_text="sin_contacto | encontrado_vivo | herido | fallecido",
+        null=True, blank=True, choices=EstadoRep.choices
     )
     ubicacion = models.TextField(
         null=True, blank=True, help_text="hospital/centro donde está (si encontrado)"
@@ -93,8 +100,8 @@ class RegistroFuente(models.Model):
     # LÍNEA ROJA: contacto de la familia. PRIVADO. Nunca en un serializer público.
     contacto = models.TextField(null=True, blank=True)
     tipo_fuente = models.TextField(
-        db_default=Value("familiar"),
-        help_text="familiar | rescatista | hospital | oficial",
+        choices=TipoFuente.choices,
+        db_default=Value(TipoFuente.FAMILIAR),
     )
     confianza = models.FloatField(
         db_default=Value(1.0), help_text="baja si vino de extracción LLM"
@@ -145,19 +152,17 @@ class PersonaCanonica(models.Model):
     )
     nombre_display = models.TextField(null=True, blank=True)
     cedula = models.TextField(null=True, blank=True)
-    # Estado de la cédula canónica: refleja la matriz cédula×cara (plan §5).
     cedula_estado = models.TextField(
-        db_default=Value("sin_confirmar"),
-        help_text="confirmada | conflicto | sin_confirmar",
+        choices=CedulaEstado.choices,
+        db_default=Value(CedulaEstado.SIN_CONFIRMAR),
     )
     cedula_confirmada_por = models.TextField(
-        null=True,
-        blank=True,
-        help_text="responder | oficial | cne | consenso",
+        null=True, blank=True, choices=CedulaConfirmadaPor.choices
     )
     zona = models.TextField(null=True, blank=True)
     estado_actual = models.TextField(
-        null=True, blank=True, help_text="derivado del claim vigente más confiable"
+        null=True, blank=True, choices=EstadoRep.choices,
+        help_text="derivado del claim vigente más confiable"
     )
     foto_principal = models.TextField(null=True, blank=True)
     n_fuentes = models.IntegerField(db_default=Value(1))
@@ -173,17 +178,6 @@ class PersonaCanonica(models.Model):
 class ClusterLink(models.Model):
     """Qué registro crudo pertenece a qué persona canónica (con score, método, etc.).
     Guarda `metodo` y autoría para permitir rollback por cuenta."""
-
-    METODOS = [
-        ("bootstrap", "bootstrap"),
-        ("cedula", "cedula"),
-        ("phash", "phash"),
-        ("fuzzy", "fuzzy"),
-        ("cara", "cara"),
-        ("llm", "llm"),
-        ("manual", "manual"),
-        ("usuario", "usuario"),
-    ]
 
     registro = models.OneToOneField(
         RegistroFuente,
@@ -201,7 +195,7 @@ class ClusterLink(models.Model):
         related_name="links",
     )
     score = models.FloatField(null=True, blank=True)
-    metodo = models.TextField(null=True, blank=True, choices=METODOS)
+    metodo = models.TextField(null=True, blank=True, choices=MetodoCluster.choices)
     confirmado = models.BooleanField(db_default=Value(False))
 
     class Meta:
@@ -237,8 +231,17 @@ class ParNegativo(models.Model):
 
 class EstadoClaim(models.Model):
     """Estados como claims versionados, atribuidos y reversibles — no verdad final.
-    estado_actual de PersonaCanonica = claim vigente más confiable.
-    Rollback por cuenta = vigente=False en todos los claims de un autor_id."""
+
+    autor_tipo discrimina qué FK de autor está poblado:
+      RESPONDER → autor_responder (FK a instituciones.Responder)
+      FAMILIAR  → autor_registro  (FK a RegistroFuente que originó el claim)
+      SISTEMA   → ambos null
+
+    corrobora apunta a otro claim que sirve como segundo testimonio.
+    Requerido para marcar fallecido (plan §11).
+
+    Rollback por cuenta = vigente=False en todos los claims del mismo autor.
+    """
 
     id = models.UUIDField(
         primary_key=True, db_default=GenRandomUUID(), editable=False
@@ -249,18 +252,34 @@ class EstadoClaim(models.Model):
         db_column="persona_id",
         related_name="claims",
     )
-    estado = models.TextField(
-        help_text="sin_contacto | encontrado_vivo | herido | fallecido"
-    )
+    estado = models.TextField(choices=EstadoRep.choices)
     ubicacion = models.TextField(null=True, blank=True)
     autor_tipo = models.TextField(
-        null=True, blank=True, help_text="familiar | responder | oficial | sistema"
+        null=True, blank=True, choices=AutorTipo.choices
     )
-    autor_id = models.UUIDField(
-        null=True, blank=True, help_text="responder_id o registro_fuente que lo originó"
+    autor_responder = models.ForeignKey(
+        "instituciones.Responder",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="claims",
+        db_column="autor_responder_id",
     )
-    corrobora_a = models.UUIDField(
-        null=True, blank=True, help_text="otro claim que confirma (p/ fallecido)"
+    autor_registro = models.ForeignKey(
+        RegistroFuente,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="claims_autorados",
+        db_column="autor_registro_id",
+    )
+    corrobora = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="corroborado_por",
+        db_column="corrobora_id",
     )
     vigente = models.BooleanField(
         db_default=Value(True), help_text="false = revertido/superado"

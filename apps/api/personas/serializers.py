@@ -149,18 +149,13 @@ class PersonaCanonicaDetailSerializer(PersonaCanonicaSerializer):
 # Escritura de registros por responders (plan §9 / Hito 3)
 # ---------------------------------------------------------------------------
 
-ESTADOS_VALIDOS_REGISTRO = {
-    "sin_contacto", "encontrado_vivo", "herido",
-    "hospitalizado", "refugiado", "fallecido",
-}
-
-
 class RegistroFuenteWriteSerializer(serializers.ModelSerializer):
     """Input para que responders registren pacientes/encontrados.
 
     Los campos de sistema (fuente, tipo_fuente, confianza, id_origen) los inyecta
     la vista usando los datos de la institución del responder autenticado.
     El campo contacto (PRIVADO) se puede enviar pero nunca aparece en el output.
+    Las choices son validadas por el modelo (TipoRegistro, EstadoRep).
     """
 
     class Meta:
@@ -170,15 +165,3 @@ class RegistroFuenteWriteSerializer(serializers.ModelSerializer):
             "zona", "ubicacion", "descripcion", "foto_url",
             "estado_rep", "contacto",
         ]
-
-    def validate_tipo(self, value):
-        if value not in ("buscado", "encontrado"):
-            raise serializers.ValidationError("Debe ser 'buscado' o 'encontrado'.")
-        return value
-
-    def validate_estado_rep(self, value):
-        if value and value not in ESTADOS_VALIDOS_REGISTRO:
-            raise serializers.ValidationError(
-                f"Estado no válido. Opciones: {', '.join(sorted(ESTADOS_VALIDOS_REGISTRO))}"
-            )
-        return value

@@ -120,29 +120,17 @@ class EstadoClaimSerializer(serializers.HyperlinkedModelSerializer):
         extra_kwargs = {"url": {"view_name": "v1:claim-detail"}}
 
 
-ESTADOS_VALIDOS = {
-    "sin_contacto", "encontrado_vivo", "herido",
-    "hospitalizado", "refugiado", "fallecido",
-}
-
-
 class EstadoClaimWriteSerializer(serializers.ModelSerializer):
-    """Escritura de claims por responders. La vista inyecta autor_tipo y autor_id."""
+    """Escritura de claims por responders. La vista inyecta autor_tipo y autor_responder."""
 
     class Meta:
         model = EstadoClaim
-        fields = ["persona", "estado", "ubicacion", "corrobora_a"]
-
-    def validate_estado(self, value):
-        if value not in ESTADOS_VALIDOS:
-            raise serializers.ValidationError(
-                f"Estado no válido. Opciones: {', '.join(sorted(ESTADOS_VALIDOS))}"
-            )
-        return value
+        fields = ["persona", "estado", "ubicacion", "corrobora"]
 
     def validate(self, data):
-        if data.get("estado") == "fallecido" and not data.get("corrobora_a"):
+        from personas.choices import EstadoRep
+        if data.get("estado") == EstadoRep.FALLECIDO and not data.get("corrobora"):
             raise serializers.ValidationError(
-                {"corrobora_a": "Registrar 'fallecido' requiere corroboración (corrobora_a)."}
+                {"corrobora": "Registrar 'fallecido' requiere corroboración (corrobora)."}
             )
         return data

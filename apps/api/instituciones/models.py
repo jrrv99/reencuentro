@@ -10,26 +10,15 @@ from django.db.models.functions import Now
 
 from personas.functions import GenRandomUUID
 
+from .choices import RolResponder, TipoInstitucion
+
 User = get_user_model()
-
-TIPOS_INSTITUCION = [
-    ("hospital", "Hospital"),
-    ("clinica", "Clínica"),
-    ("organizacion", "Organización"),
-    ("oficial", "Ente oficial"),
-    ("partner", "Partner (Cruz Roja / Prot. Civil)"),
-]
-
-ROLES_RESPONDER = [
-    ("miembro", "Miembro"),
-    ("admin", "Admin de workspace"),
-]
 
 
 class Institucion(models.Model):
     id = models.UUIDField(primary_key=True, db_default=GenRandomUUID(), editable=False)
     nombre = models.TextField()
-    tipo = models.TextField(choices=TIPOS_INSTITUCION, default="hospital")
+    tipo = models.TextField(choices=TipoInstitucion.choices, default=TipoInstitucion.HOSPITAL)
     zona = models.TextField(null=True, blank=True, help_text="Ciudad/estado de referencia")
     verificada = models.BooleanField(
         default=False,
@@ -65,7 +54,7 @@ class Responder(models.Model):
     institucion = models.ForeignKey(
         Institucion, on_delete=models.CASCADE, related_name="responders"
     )
-    rol = models.TextField(choices=ROLES_RESPONDER, default="miembro")
+    rol = models.TextField(choices=RolResponder.choices, default=RolResponder.MIEMBRO)
     activo = models.BooleanField(default=True)
     created_at = models.DateTimeField(db_default=Now())
 

@@ -1,9 +1,12 @@
 """Tests de CRUD y permisos para instituciones, responders y claims."""
+import uuid
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from instituciones.models import Institucion, Responder
+from personas.choices import AutorTipo, EstadoRep
 from personas.models import EstadoClaim, PersonaCanonica, RegistroFuente
 
 User = get_user_model()
@@ -307,8 +310,8 @@ class EstadoClaimTests(TestCase):
         )
         self.assertEqual(r.status_code, 201)
         claim = EstadoClaim.objects.get()
-        self.assertEqual(claim.autor_tipo, "responder")
-        self.assertEqual(claim.autor_id, self.resp_verif.id)
+        self.assertEqual(claim.autor_tipo, AutorTipo.RESPONDER)
+        self.assertEqual(claim.autor_responder_id, self.resp_verif.id)
         self.assertTrue(claim.vigente)
 
     def test_claim_actualiza_estado_actual_canonico(self):
@@ -322,15 +325,17 @@ class EstadoClaimTests(TestCase):
         self.assertEqual(self.persona.estado_actual, "encontrado_vivo")
 
     def test_fallecido_requiere_verificada(self):
+        """Institución no verificada recibe 403 antes de cualquier validación de datos."""
         self._auth("novato@test.com")
         r = self.client.post(
             "/api/v1/claims/",
-            {"persona": str(self.persona.id), "estado": "fallecido", "corrobora_a": str(self.persona.id)},
+            {"persona": str(self.persona.id), "estado": "fallecido", "corrobora": str(uuid.uuid4())},
             format="json",
         )
         self.assertEqual(r.status_code, 403)
 
-    def test_fallecido_requiere_corrobora_a(self):
+    def test_fallecido_requiere_corrobora(self):
+        """Institución verificada + sin corrobora → 400."""
         self._auth("doctor@test.com")
         r = self.client.post(
             "/api/v1/claims/",
@@ -338,17 +343,22 @@ class EstadoClaimTests(TestCase):
             format="json",
         )
         self.assertEqual(r.status_code, 400)
-        self.assertIn("corrobora_a", r.data)
+        self.assertIn("corrobora", r.data)
 
     def test_fallecido_verificada_con_corroboracion_ok(self):
+        """Institución verificada + corrobora válido → 201."""
         self._auth("doctor@test.com")
-        import uuid
+        corrobora_claim = EstadoClaim.objects.create(
+            persona=self.persona,
+            estado=EstadoRep.ENCONTRADO_VIVO,
+            autor_tipo=AutorTipo.SISTEMA,
+        )
         r = self.client.post(
             "/api/v1/claims/",
             {
                 "persona": str(self.persona.id),
                 "estado": "fallecido",
-                "corrobora_a": str(uuid.uuid4()),
+                "corrobora": str(corrobora_claim.id),
             },
             format="json",
         )
