@@ -333,6 +333,16 @@ def ingest_file(
     return stats
 
 
+def _encolar_dedup(registro_id: str) -> None:
+    """Encola dedup_record post-commit. Import diferido para evitar ciclo de imports."""
+    try:
+        from dedup.tasks import dedup_record
+        dedup_record.delay(registro_id)
+    except Exception:
+        # Si Celery no está disponible (tests sin broker, dev sin worker), no abortar.
+        logger.debug("dedup_record no encolado para %s (broker no disponible)", registro_id)
+
+
 @transaction.atomic
 def _process_record(record: dict[str, Any], stats: RunStats) -> None:
     fuente = record.get("fuente", "")
@@ -362,8 +372,10 @@ def _process_record(record: dict[str, Any], stats: RunStats) -> None:
             setattr(existing, attr, val)
         existing.save()
         stats.actualizados += 1
+        transaction.on_commit(lambda: _encolar_dedup(str(existing.id)))
     else:
         fields = _map_record(record)
         fields["content_hash"] = new_hash
-        RegistroFuente.objects.create(**fields)
+        registro = RegistroFuente.objects.create(**fields)
         stats.insertados += 1
+        transaction.on_commit(lambda: _encolar_dedup(str(registro.id)))
