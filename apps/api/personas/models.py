@@ -175,6 +175,7 @@ class ClusterLink(models.Model):
     Guarda `metodo` y autoría para permitir rollback por cuenta."""
 
     METODOS = [
+        ("bootstrap", "bootstrap"),
         ("cedula", "cedula"),
         ("phash", "phash"),
         ("fuzzy", "fuzzy"),

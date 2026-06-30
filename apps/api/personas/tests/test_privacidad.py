@@ -1,40 +1,42 @@
-"""Guardián de la LÍNEA ROJA de privacidad (plan §11/§14).
+"""Guardián de la LÍNEA ROJA de privacidad (plan §11/§14/§15).
 
-Si algún día un campo prohibido (contacto, cédula cruda, identidad de responder,
-face_embedding) se filtra al serializer público, estos tests DEBEN fallar.
+Si algún día un campo prohibido (contacto, cédula cruda, face_embedding,
+raw_payload) se filtra al serializer público, estos tests DEBEN fallar.
+
+Nota: tipo_fuente SÍ es público en RegistroFuente (está en PUBLIC_REGISTRO_FIELDS
+del plan §15), por lo que puede aparecer en respuestas que expandan registros
+inline (ej. detalle de PersonaCanonica). Los campos verdaderamente prohibidos
+son los enumerados en CAMPOS_PROHIBIDOS abajo.
 """
 import json
 
 from django.conf import settings
 from django.test import override_settings
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIRequestFactory, APITestCase
 
 from personas.models import ClusterLink, PersonaCanonica, RegistroFuente
-from personas.serializers import PersonaCanonicaPublicSerializer
+from personas.serializers import PersonaCanonicaSerializer
 
-# Mismo REST_FRAMEWORK del proyecto pero sin throttling, para que los tests no
-# dependan de Redis ni se vuelvan flaky al re-correrlos dentro de la misma ventana.
 RF_SIN_THROTTLE = {
     **settings.REST_FRAMEWORK,
     "DEFAULT_THROTTLE_CLASSES": [],
     "DEFAULT_THROTTLE_RATES": {},
 }
 
-LISTA = "/api/v1/personas/"
+LISTA_PERSONAS = "/api/v1/personas/"
+LISTA_REGISTROS = "/api/v1/registros/"
 
-# Valores sensibles sembrados en el registro crudo. NINGUNO puede aparecer en la
-# respuesta pública, ni como valor ni como nombre de campo.
 CONTACTO_SECRETO = "0414-CONTACTO-PRIVADO-555"
 CEDULA_SECRETA = "V-13860574"
 EMBEDDING = [0.0123] * 512
 
+# Campos que NUNCA pueden aparecer en ningún response público.
 CAMPOS_PROHIBIDOS = {
     "contacto",
     "cedula",
     "face_embedding",
     "raw_payload",
-    "tipo_fuente",  # identidad/origen del responder
     "responder",
     "responder_id",
 }
@@ -59,7 +61,7 @@ class PrivacidadPublicaTests(APITestCase):
             cedula=CEDULA_SECRETA,
             edad=34,
             zona="Carabobo",
-            contacto=CONTACTO_SECRETO,  # PRIVADO
+            contacto=CONTACTO_SECRETO,
             face_embedding=EMBEDDING,
             tipo_fuente="hospital",
         )
@@ -71,7 +73,6 @@ class PrivacidadPublicaTests(APITestCase):
             confirmado=True,
         )
 
-    # --- la prueba que importa --------------------------------------------------
     def _assert_sin_secretos(self, blob: str):
         self.assertNotIn(CONTACTO_SECRETO, blob, "¡Se filtró el contacto!")
         self.assertNotIn(CEDULA_SECRETA, blob, "¡Se filtró la cédula cruda!")
@@ -80,45 +81,77 @@ class PrivacidadPublicaTests(APITestCase):
         for campo in CAMPOS_PROHIBIDOS:
             self.assertNotIn(f'"{campo}"', blob, f"¡Campo prohibido expuesto: {campo}!")
 
-    def test_lista_no_filtra_datos_privados(self):
-        resp = self.client.get(LISTA)
+    # --- personas/ ---------------------------------------------------------------
+
+    def test_lista_personas_no_filtra_datos_privados(self):
+        resp = self.client.get(LISTA_PERSONAS)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self._assert_sin_secretos(json.dumps(resp.json()))
 
-    def test_detalle_no_filtra_datos_privados(self):
-        resp = self.client.get(f"{LISTA}{self.persona.id}/")
+    def test_detalle_persona_no_filtra_datos_privados(self):
+        resp = self.client.get(f"{LISTA_PERSONAS}{self.persona.id}/")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self._assert_sin_secretos(json.dumps(resp.json()))
 
-    def test_serializer_solo_expone_allowlist(self):
-        """Blindaje extra: el set de claves del serializer es EXACTAMENTE el permitido."""
-        data = PersonaCanonicaPublicSerializer(self.persona).data
+    def test_serializer_lista_persona_expone_solo_allowlist(self):
+        """El set de claves del serializer de lista es EXACTAMENTE el permitido."""
+        factory = APIRequestFactory()
+        request = factory.get(LISTA_PERSONAS)
+        data = PersonaCanonicaSerializer(self.persona, context={"request": request}).data
         self.assertEqual(
             set(data.keys()),
-            {"id", "nombre", "zona", "edad_aprox", "estado", "ultima_vez_visto", "fuentes"},
+            {"url", "nombre_display", "zona", "estado_actual", "foto_principal", "n_fuentes", "updated_at"},
         )
-        # Las fuentes solo llevan nombre de fuente + URL de vuelta.
-        for fuente in data["fuentes"]:
-            self.assertEqual(set(fuente.keys()), {"fuente", "url_origen"})
 
-    # --- comportamiento público correcto ---------------------------------------
-    def test_expone_campos_publicos_y_linkback(self):
-        item = self.client.get(LISTA).json()["results"][0]
-        self.assertEqual(item["nombre"], "María Pérez")
+    # --- registros/ --------------------------------------------------------------
+
+    def test_lista_registros_no_filtra_datos_privados(self):
+        resp = self.client.get(LISTA_REGISTROS)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self._assert_sin_secretos(json.dumps(resp.json()))
+
+    def test_detalle_registro_no_filtra_datos_privados(self):
+        resp = self.client.get(f"{LISTA_REGISTROS}{self.registro.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self._assert_sin_secretos(json.dumps(resp.json()))
+
+    # --- comportamiento público correcto -----------------------------------------
+
+    def test_lista_personas_expone_campos_publicos(self):
+        item = self.client.get(LISTA_PERSONAS).json()["results"][0]
+        self.assertEqual(item["nombre_display"], "María Pérez")
         self.assertEqual(item["zona"], "Carabobo")
-        self.assertEqual(item["estado"], "encontrado_vivo")
-        self.assertEqual(item["edad_aprox"], "30-39")  # aprox, nunca el número exacto
-        self.assertIsNotNone(item["ultima_vez_visto"])
-        self.assertEqual(item["fuentes"][0]["fuente"], "dtv")
+        self.assertEqual(item["estado_actual"], "encontrado_vivo")
+        self.assertIn("url", item)
+        self.assertIn("n_fuentes", item)
+
+    def test_detalle_persona_expande_registros_inline(self):
+        data = self.client.get(f"{LISTA_PERSONAS}{self.persona.id}/").json()
+        self.assertIn("registros", data)
+        self.assertEqual(len(data["registros"]), 1)
+        reg = data["registros"][0]
+        self.assertEqual(reg["fuente"], "dtv")
+        self.assertEqual(reg["nombre"], "María Pérez")
+        self.assertIn("url", reg)
+
+    def test_detalle_registro_expande_persona_inline(self):
+        data = self.client.get(f"{LISTA_REGISTROS}{self.registro.id}/").json()
+        self.assertIn("persona", data)
+        self.assertIsNotNone(data["persona"])
+        self.assertEqual(data["persona"]["nombre_display"], "María Pérez")
+
+    def test_filtros_busqueda_personas(self):
+        self.assertEqual(self.client.get(f"{LISTA_PERSONAS}?nombre=maría").json()["count"], 1)
+        self.assertEqual(self.client.get(f"{LISTA_PERSONAS}?nombre=zoltan").json()["count"], 0)
+        self.assertEqual(self.client.get(f"{LISTA_PERSONAS}?zona=carabobo").json()["count"], 1)
         self.assertEqual(
-            item["fuentes"][0]["url_origen"],
-            "https://desaparecidos.example/abc-123",
+            self.client.get(f"{LISTA_PERSONAS}?estado=encontrado_vivo").json()["count"], 1
         )
 
-    def test_filtros_busqueda(self):
-        self.assertEqual(self.client.get(f"{LISTA}?nombre=maría").json()["count"], 1)
-        self.assertEqual(self.client.get(f"{LISTA}?nombre=zoltan").json()["count"], 0)
-        self.assertEqual(self.client.get(f"{LISTA}?zona=carabobo").json()["count"], 1)
+    def test_filtros_busqueda_registros(self):
+        self.assertEqual(self.client.get(f"{LISTA_REGISTROS}?fuente=dtv").json()["count"], 1)
+        self.assertEqual(self.client.get(f"{LISTA_REGISTROS}?fuente=vtb").json()["count"], 0)
         self.assertEqual(
-            self.client.get(f"{LISTA}?estado=encontrado_vivo").json()["count"], 1
+            self.client.get(f"{LISTA_REGISTROS}?estado_rep=encontrado_vivo").json()["count"], 0
         )
+        self.assertEqual(self.client.get(f"{LISTA_REGISTROS}?zona=carabobo").json()["count"], 1)

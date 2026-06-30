@@ -1,59 +1,93 @@
-"""Serializers PÚBLICOS.
+"""Serializers PÚBLICOS — patrón lista / detalle con HyperlinkedModelSerializer.
 
-LÍNEA ROJA (plan §11/§14, no negociable): la salida pública expone SOLO
-nombre, zona, edad aprox, estado, última vez visto y links a fuentes.
-NUNCA contacto, cédula cruda, identidad de responders ni face_embedding.
+LÍNEA ROJA (plan §11/§14/§15, no negociable): la salida pública expone SOLO
+los campos de PUBLIC_REGISTRO_FIELDS y los campos públicos de PersonaCanonica.
+NUNCA contacto, cédula cruda, face_embedding, raw_payload ni identidad de responders.
 
-Por diseño defensivo NO usamos `fields = "__all__"` ni exponemos el modelo
-RegistroFuente entero: declaramos campo por campo, en allow-list. El test
-personas/tests/test_privacidad.py falla si algo prohibido se llegara a filtrar.
+Convención obligatoria (plan §15):
+  - Base: HyperlinkedModelSerializer. Relaciones = URLs en lista.
+  - Detalle: to_representation expande relaciones inline.
+  - allow-list en fields = [...]. Si no está en fields, no existe en el output.
+    NUNCA se filtra con `if campo in ...`.
 """
 from rest_framework import serializers
 
-from .models import PersonaCanonica
+from .models import PersonaCanonica, RegistroFuente
+
+# Campos públicos de RegistroFuente (plan §15). Esta constante es la allow-list
+# autoritativa — cualquier cambio aquí se refleja en la API y en los tests.
+PUBLIC_REGISTRO_FIELDS = [
+    "url",
+    "fuente",
+    "url_origen",
+    "tipo",
+    "nombre",
+    "edad",
+    "sexo",
+    "zona",
+    "ubicacion",
+    "descripcion",
+    "foto_url",
+    "estado_rep",
+    "tipo_fuente",
+    "confianza",
+    "ingested_at",
+]
 
 
-class FuenteLinkSerializer(serializers.Serializer):
-    """Link de vuelta al origen. Solo nombre de fuente + URL pública. Nada más."""
+class RegistroFuenteSerializer(serializers.HyperlinkedModelSerializer):
+    """Lista de registros fuente: campos públicos + URL canónica."""
 
-    fuente = serializers.CharField()
-    url_origen = serializers.URLField(allow_null=True)
+    class Meta:
+        model = RegistroFuente
+        fields = PUBLIC_REGISTRO_FIELDS
+        extra_kwargs = {
+            "url": {"view_name": "v1:registro-detail"},
+        }
 
 
-class PersonaCanonicaPublicSerializer(serializers.ModelSerializer):
-    nombre = serializers.CharField(source="nombre_display", allow_null=True)
-    estado = serializers.CharField(source="estado_actual", allow_null=True)
-    edad_aprox = serializers.SerializerMethodField()
-    ultima_vez_visto = serializers.SerializerMethodField()
-    fuentes = serializers.SerializerMethodField()
+class RegistroFuenteDetailSerializer(RegistroFuenteSerializer):
+    """Detalle de un registro fuente: expande la PersonaCanonica enlazada inline."""
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        persona = None
+        link = getattr(instance, "cluster_link", None)
+        if link is not None and link.persona_id:
+            persona = PersonaCanonicaSerializer(link.persona, context=self.context).data
+        data["persona"] = persona
+        return data
+
+
+class PersonaCanonicaSerializer(serializers.HyperlinkedModelSerializer):
+    """Lista de personas canónicas: campos públicos de la entidad resuelta."""
 
     class Meta:
         model = PersonaCanonica
-        # Allow-list explícita. Cualquier campo NO listado jamás se serializa.
-        fields = ["id", "nombre", "zona", "edad_aprox", "estado", "ultima_vez_visto", "fuentes"]
+        fields = [
+            "url",
+            "nombre_display",
+            "zona",
+            "estado_actual",
+            "foto_principal",
+            "n_fuentes",
+            "updated_at",
+        ]
+        extra_kwargs = {
+            "url": {"view_name": "v1:persona-detail"},
+        }
 
-    def _registros(self, persona):
-        # registros crudos enlazados a esta persona (vía cluster_links).
-        return [link.registro for link in persona.links.all() if link.registro_id]
 
-    def get_edad_aprox(self, persona):
-        """Edad en rango (década), nunca el número exacto — es *aprox*."""
-        edades = [r.edad for r in self._registros(persona) if r.edad is not None]
-        if not edades:
-            return None
-        edad = round(sum(edades) / len(edades))
-        base = (edad // 10) * 10
-        return f"{base}-{base + 9}"
+class PersonaCanonicaDetailSerializer(PersonaCanonicaSerializer):
+    """Detalle de una persona canónica: expande los registros fuente enlazados inline."""
 
-    def get_ultima_vez_visto(self, persona):
-        fechas = [r.ingested_at for r in self._registros(persona) if r.ingested_at]
-        return max(fechas).isoformat() if fechas else None
-
-    def get_fuentes(self, persona):
-        vistos, salida = set(), []
-        for r in self._registros(persona):
-            if r.fuente in vistos:
-                continue
-            vistos.add(r.fuente)
-            salida.append({"fuente": r.fuente, "url_origen": r.url_origen})
-        return FuenteLinkSerializer(salida, many=True).data
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # instance.links es el prefetch de ClusterLink.select_related("registro")
+        # configurado en PersonaCanonicaViewSet.get_queryset(). Acceder con .all()
+        # usa la caché del prefetch y evita el N+1.
+        registros = [cl.registro for cl in instance.links.all() if cl.registro_id]
+        data["registros"] = RegistroFuenteSerializer(
+            registros, many=True, context=self.context
+        ).data
+        return data

@@ -1,13 +1,11 @@
-"""Filtros del buscador público: ?nombre=&zona=&estado=."""
+"""Filtros del buscador público: ?nombre=&zona=&estado=&fuente=&tipo_fuente=…"""
 import django_filters
 
-from .models import PersonaCanonica
+from .models import PersonaCanonica, RegistroFuente
 
 
 class PersonaCanonicaFilter(django_filters.FilterSet):
-    # Búsqueda por nombre: insensible a acentos y mayúsculas (el punto del plan:
-    # una familia teclea "maria" y debe encontrar "María"). El fuzzy/trigram real
-    # es del motor de dedup (hito siguiente); aquí basta unaccent + icontains.
+    # Búsqueda por nombre: insensible a acentos y mayúsculas (plan §15).
     nombre = django_filters.CharFilter(
         field_name="nombre_display", lookup_expr="unaccent__icontains"
     )
@@ -21,3 +19,20 @@ class PersonaCanonicaFilter(django_filters.FilterSet):
     class Meta:
         model = PersonaCanonica
         fields = ["nombre", "zona", "estado"]
+
+
+class RegistroFuenteFilter(django_filters.FilterSet):
+    zona = django_filters.CharFilter(
+        field_name="zona", lookup_expr="unaccent__icontains"
+    )
+    fuente = django_filters.CharFilter(field_name="fuente", lookup_expr="iexact")
+    estado_rep = django_filters.CharFilter(
+        field_name="estado_rep", lookup_expr="iexact"
+    )
+    tipo_fuente = django_filters.CharFilter(
+        field_name="tipo_fuente", lookup_expr="iexact"
+    )
+
+    class Meta:
+        model = RegistroFuente
+        fields = ["fuente", "zona", "estado_rep", "tipo_fuente"]
