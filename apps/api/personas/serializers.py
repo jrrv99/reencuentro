@@ -10,6 +10,7 @@ Convención obligatoria (plan §15):
   - allow-list en fields = [...]. Si no está en fields, no existe en el output.
     NUNCA se filtra con `if campo in ...`.
 """
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from .models import PersonaCanonica, RegistroFuente
@@ -104,6 +105,7 @@ class PersonaCanonicaSerializer(serializers.HyperlinkedModelSerializer):
         # para evitar N+1. El .all() accede a la caché del prefetch.
         return [link.registro for link in persona.links.all() if link.registro_id]
 
+    @extend_schema_field(serializers.CharField(allow_null=True))
     def get_edad_aprox(self, persona):
         """Edad en rango de década. Nunca el número exacto — privacidad por diseño."""
         edades = [r.edad for r in self._registros(persona) if r.edad is not None]
@@ -113,10 +115,12 @@ class PersonaCanonicaSerializer(serializers.HyperlinkedModelSerializer):
         base = (edad // 10) * 10
         return f"{base}-{base + 9}"
 
+    @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_ultima_vez_visto(self, persona):
         fechas = [r.ingested_at for r in self._registros(persona) if r.ingested_at]
         return max(fechas).isoformat() if fechas else None
 
+    @extend_schema_field(FuenteLinkSerializer(many=True))
     def get_fuentes(self, persona):
         """Links de vuelta a cada fuente de origen. Deduplicados por fuente."""
         vistos, salida = set(), []
