@@ -11,6 +11,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 # Todo lo de la v1 vive bajo este prefijo.
 api_v1 = [
     path("", include("personas.urls")),
+    path("", include("instituciones.urls")),
     # Auth — solo para responders/instituciones (el público nunca se autentica)
     path("auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
