@@ -1,8 +1,3 @@
-# Infra de desarrollo: levanta SOLO la base de datos y el broker.
-# La API Django se corre localmente (venv) contra estos servicios.
-#   cd infra && docker compose up -d
-#
-# pgvector/pgvector:pg16 = Postgres 16 con la extensión `vector` ya compilada.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -35,6 +30,49 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    container_name: reencuentro_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Dentro de Docker los servicios se resuelven por nombre y puerto interno,
+      # independiente de los puertos del host en .env.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      # Monta el código fuente para hot-reload en desarrollo.
+      - ../apps/api:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Para correr solo infra (sin api): docker compose up -d db redis
+
+  # worker:
+  #   build:
+  #     context: ../apps/api
+  #     dockerfile: Dockerfile
+  #   env_file: [.env]
+  #   environment:
+  #     POSTGRES_HOST: db
+  #     REDIS_URL: redis://redis:6379/0
+  #   volumes:
+  #     - ../apps/api:/app
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   command: celery -A config worker -l info
 
 volumes:
   pgdata:

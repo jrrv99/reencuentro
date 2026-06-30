@@ -4,130 +4,186 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Early Fase 0.** First milestone landed: the monorepo skeleton (`apps/api/` Django project
-with `config/` + the five apps registered), `infra/` compose (Postgres+pgvector & Redis),
-the `personas` app reproducing the plan §3 schema (with extensions, the generated
-`nombre_norm`, GIN-trigram / HNSW / partial-unique indexes), and a read-only, privacy-filtered
-`GET /api/v1/personas` with OpenAPI docs. Still **not built**: ingest connectors, the dedup
-engine, the face stack (`identidad`), instituciones/responders, the Next.js frontend.
-**The plan is the source of truth** for architecture and constraints — read it before building,
-and keep it in sync if the design changes. See `## Commands` for how to run things.
+**Fase 0 — en curso.** Hitos completados:
+- Esqueleto del monorepo (`apps/api/` Django + `config/` + 5 apps registradas)
+- `infra/` compose completo: Postgres+pgvector, Redis, **y el servicio `api` Django**
+- App `personas`: modelos del plan §3 (con `nombre_norm`/`cedula_norm` generados, índices GIN-trigram, HNSW, partial-unique), migraciones 0001–0003 (extensiones, esquema, reconciliación de cédula)
+- App `ingesta`: conector idempotente del consolidador (upsert sobre `(fuente, id_origen)`, `content_hash`, centinelas de cédula, parseo no-silencioso, `SyncRun`)
+- **56k registros reales cargados en local** vía `ingesta_consolidador`
+- `GET /api/v1/personas/` funcional (buscador público, privacy-filtered, `PersonaCanonicaViewSet`)
+
+**En construcción ahora:** ViewSet APIs completas — `RegistroFuenteViewSet` + refactor a `HyperlinkedModelSerializer` con expansión inline en detalle (plan §9).
+
+**Pendiente:** motor de dedup (Hito 2b), stack de caras (`identidad`), instituciones/responders, frontend Next.js.
+
+**El plan es la fuente de verdad** — leerlo antes de construir. `plans/plan_migracion_datos.md` para arquitectura de datos/APIs; `plans/plan_maestro_desaparecidos.md` para el diseño completo del sistema.
+
+---
 
 ## What this is
 
-`reencuentro` is an **aggregator with identity resolution** for missing persons after the 2026 Venezuela earthquake. It is **not** another registry. It ingests from existing registries/sources, deduplicates people across them, and exposes a **single search** that shows each person once and **links back** to every origin source. It unifies existing platforms and sends them traffic — it does not compete with or replace them.
+`reencuentro` es un **agregador con resolución de identidades** para desaparecidos tras el terremoto Venezuela 2026. No es otro registro — ingiere de los registros existentes, deduplica entre ellos y expone **una sola búsqueda** que muestra a cada persona una vez y enlaza de vuelta a cada origen. Unifica las plataformas existentes y les manda tráfico.
 
-## Stack (planned)
+---
+
+## Stack
 
 | Concern | Tech |
 |---|---|
-| Core API + dedup + admin | Django / DRF (`drf-spectacular` for OpenAPI, `django-filter`, `simplejwt`) |
+| Core API + dedup + admin | Django / DRF (`drf-spectacular`, `django-filter`, `simplejwt`) |
 | Ingest & matching jobs | Celery + Celery Beat |
 | Canonical store + text fuzzy | PostgreSQL (`pg_trgm`, `unaccent`) |
-| Face search | **pgvector**, 512-D embeddings, HNSW + cosine (`<=>`) |
+| Face search | **pgvector**, embeddings 512-D, HNSW + cosine (`<=>`) |
 | Cache + broker | Redis |
 | Connector/webhook orchestration | n8n |
-| Free-text extraction from social posts | Ollama (local LLM) |
-| Public search (read-heavy) | Next.js on Vercel/Cloudflare |
+| Free-text extraction from social posts | Ollama (LLM local) |
+| Public search (read-heavy) | Next.js en Vercel/Cloudflare |
 | Edge / cache / rate-limit | Cloudflare |
-| Face stack | InsightFace (`buffalo_l`, ArcFace, ONNX) for embeddings; `imagehash` pHash for same-photo detection; `rapidfuzz` for name fuzzy |
+| Face stack | InsightFace (`buffalo_l`, ArcFace, ONNX); `imagehash` pHash; `rapidfuzz` |
 
-## Intended repo layout (monorepo)
+---
+
+## Repo layout
 
 ```
 reencuentro/
 ├── apps/
-│   ├── api/               # Django/DRF + Celery (the core)
+│   ├── api/               # Django/DRF + Celery
 │   │   ├── config/        # settings, celery, urls
-│   │   ├── personas/      # registros_fuente, personas_canonicas, estado_claims, cluster_links, pares_negativos
-│   │   ├── ingesta/       # Tier A/B/C connectors (Celery tasks)
-│   │   ├── dedup/         # scoring + blocking + union-find
-│   │   ├── identidad/     # faces (insightface+pgvector), phash, matching
-│   │   └── instituciones/ # workspaces, responders, validation, auditoría
-│   └── web/               # Next.js (public search + responder app)
-├── infra/                 # docker-compose, Coolify config, .env templates
-└── plans/                 # the master plan
+│   │   ├── personas/      # registros_fuente, personas_canonicas, cluster_links, claims, negativos
+│   │   ├── ingesta/       # conectores Tier A/B/C (Celery tasks) + SyncRun
+│   │   ├── dedup/         # scoring + blocking + union-find  [pendiente]
+│   │   ├── identidad/     # caras (insightface+pgvector), phash  [pendiente]
+│   │   └── instituciones/ # workspaces, responders, auditoría  [pendiente]
+│   └── web/               # Next.js  [pendiente]
+├── infra/                 # docker-compose (db + redis + api), .env templates
+└── plans/                 # plan maestro + plan de migración
 ```
 
-Each Django app is an **independent module** (SiteHub philosophy): e.g. `dedup` is built and tested without touching `ingesta`. Monorepo is a deliberate choice (single builder, atomic backend+frontend changes, one CI, Coolify deploy-by-subfolder).
+---
 
-## Core architecture (the parts that span multiple modules)
+## Core architecture
 
 **Raw data is never destroyed.** Three-layer identity resolution:
-- `registros_fuente` — raw, one row per report per source. Crude data is canonical and immutable.
-- `personas_canonicas` — the resolved entity. **It is a *view* built by clustering**, not authored data. If dedup is wrong, re-cluster without losing anything.
-- `cluster_links` — which raw records are the same person (with `score`, `metodo`, `confirmado`). `pares_negativos` records "already judged NOT the same" so we never re-ask.
+- `registros_fuente` — crudo, 1 fila por reporte por fuente. Canónico e inmutable.
+- `personas_canonicas` — la entidad resuelta. Es una *vista* construida por clustering. Si el dedup se equivoca, se re-clusteriza sin perder nada.
+- `cluster_links` — qué registros crudos son la misma persona (`score`, `metodo`, `confirmado`). `pares_negativos` = "ya se juzgó que NO son la misma".
 
-**One dedup engine, shared by all three systems** (`dedup/`). On insert/change of a record (via Celery): normalize → **blocking** (candidates = same zona OR same cédula OR trigram-similar name; faces compared only against this shortlist, never the whole DB) → per-pair scoring → thresholds (high = merge, medium = review queue, low = new person) → union-find clustering respecting `pares_negativos`. **Cédula match = 1.0 auto-merge. Without cédula, NEVER auto-merge** — face is a signal that surfaces candidates, never the judge (common names + facial similarity = false merges, whose cost here is atrocious).
+**Motor de dedup único** (`dedup/`), compartido por los 3 sistemas. En cada insert/cambio (vía Celery): normalizar → bloqueo → scoring por par → umbrales → union-find respetando `pares_negativos`. **Cédula match = 1.0 auto-merge. Sin cédula, NUNCA auto-merge** — la cara surfacea candidatos, no decide.
 
-**Estados are versioned, attributed, reversible claims** (`estado_claims`), not final truth. `personas_canonicas.estado_actual` = the most trustworthy `vigente` claim. Rollback-by-account = set `vigente=false` for all claims of an `autor_id`. This is the backbone of the trust model: identity is for **attribution and deterrence**, not for gating trust — act, but everything is attributable and undoable.
+**Estados como claims versionados, atribuidos y reversibles** (`estado_claims`). `personas_canonicas.estado_actual` = el claim `vigente` más confiable. Rollback por cuenta = marcar `vigente=false` en todos los claims de un `autor_id`.
 
-**Multi-tenant for identity/access, mono-tenant for the data.** Workspace = institution, and `institucion_id` scopes ONLY membership/permissions/auditoría. The person index (`registros_fuente`, `personas_canonicas`, `cluster_links`, face index) is **global and shared** — a doctor must match against family reports nationwide. **Do NOT use schema-per-tenant for person data.**
+**Multi-tenant para acceso, mono-tenant para la data.** `institucion_id` gobierna solo membresía/permisos. El índice de personas es global — un doctor debe matchear contra reportes de todo el país.
 
-**The loop that justifies everything:** doctor marks "encontrado vivo en Hospital X" → `registros_fuente` row → dedup cross-matches the "buscado" (cédula or face) → `personas_canonicas` updates → **the searching family gets notified.**
+---
 
-### The three identity systems (all share the dedup engine)
-1. **Interactive dedup on registration** — Google Person Finder style; catch the duplicate before it dirties the DB. Generous threshold (a human is deciding live). Same-photo → pHash; other photo of same person → face embedding → review.
-2. **Reverse face search of found persons** — responder photographs an unidentified person, searches against the missing. High recall / low threshold (~15 candidates; injured faces degrade). **Verified responders only, every query audited. The public NEVER uploads a face to search** (that would be surveillance). No facial recognition of the deceased — that's forensic (Cruz Roja territory); focus is 100% on the living.
-3. **Responders + found-person capture** — the trusted input layer. Identify in order: cédula → name → face (last resort, minimize biometric use). "No identificado" enters with photo/embedding and auto-matches when a family later uploads a photo.
+## API design conventions (plan §9)
 
-### Ingest is hybrid (3 tiers), each connector an isolated Celery task
-- **Tier A** — cooperation: consume CSV/JSON/PFIF exports. Cleanest; the goal is to move everything here.
-- **Tier B** — scraping (requests/Playwright per site). Fragile, breaks on site changes → budget maintenance.
-- **Tier C** — social free-text → Ollama extracts JSON → enters with low `confianza` + review flag. n8n orchestrates polling.
+### ViewSets
+`ReadOnlyModelViewSet` para recursos públicos. El ViewSet elige el serializer según la acción:
 
-## Hard constraints — red lines (non-negotiable, enforce in code)
+```python
+def get_serializer_class(self):
+    if self.action == "retrieve":
+        return MiRecursoDetailSerializer
+    return MiRecursoSerializer
+```
 
-- **Public never authenticates.** Search/report/"I found them" is anonymous and one-touch. You register an account ONLY to write authoritative truth about others (responders/institutions). Anti-abuse for anonymous reports = Turnstile captcha + per-IP rate limit + dedup + moderation queue.
-- **`contacto` (family contact) is PRIVATE, always.** Never exposed in any public serializer; responders never see it (the system notifies the family). Optional notification contact is stored privately, has no login, is never public.
-- **Public serializers expose ONLY:** nombre, zona, approx edad, estado, last-seen, links to sources. **Never** `contacto`, raw cédula, responder identity, or `face_embedding`. Never a bulk endpoint that dumps photos/embeddings.
-- **`fallecido`** is gated: behind workspace validation, requires corroboration (verified institution + a second contribution or official source); a single account cannot mark anyone dead. Provisional workspaces have `fallecido` **blocked**.
-- **Biometrics are a last resort** (cédula/name first). When verifying strong identity (selfie-vs-cédula), store only the match result + embedding and **discard the raw cédula image**.
-- **We are NOT official.** Say so clearly; provide a correction/takedown path; minimize public PII.
+### Serializers — patrón lista / detalle
+Base `HyperlinkedModelSerializer`. En lista las relaciones son `HyperlinkedRelatedField` (URLs). En detalle `to_representation` las expande inline con el serializer del recurso relacionado:
 
-## Access rings (API auth)
-- **Public read** (search) → simple API key + strong throttling + privacy filter. Read-only.
-- **Ingest** (cooperating sources) → per-source token.
-- **Responder actions** → JWT (`simplejwt`) + role gate.
+```python
+class PersonaCanonicaDetailSerializer(PersonaCanonicaSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        registros_qs = instance.cluster_links.select_related("registro")
+        data["registros"] = RegistroFuenteSerializer(
+            [cl.registro for cl in registros_qs],
+            many=True, context=self.context,
+        ).data
+        return data
+```
 
-API is versioned `/api/v1/` from day one. Throttle at DRF **and** Cloudflare; edge-cache reads — the existing platforms fall over because they don't cache, not for lack of money.
+### Privacidad — allow-list estricta
+`contacto`, `face_embedding`, `raw_payload`, `cedula` cruda y datos de responder **nunca aparecen en serializers públicos**. La allow-list está en `fields = [...]` del Meta. Si el campo no está en `fields`, no existe en el output — nunca se filtra con `if`.
+
+```python
+PUBLIC_REGISTRO_FIELDS = [
+    "url", "fuente", "url_origen", "tipo", "nombre",
+    "edad", "sexo", "zona", "ubicacion", "descripcion",
+    "foto_url", "estado_rep", "tipo_fuente", "confianza", "ingested_at",
+]
+```
+
+### Filtros
+`django-filter` + `SearchFilter` + `OrderingFilter` en todos los ViewSets. Búsqueda por nombre: `__unaccent__icontains` (insensible a acentos — eso es el punto del plan).
+
+---
+
+## Hard constraints — líneas rojas
+
+- **El público NO se autentica.** Buscar/reportar es anónimo. Cuenta = solo para escribir verdad autoritativa sobre otros (responders/instituciones).
+- **`contacto` es PRIVADO, siempre.** Nunca en ningún serializer público; los responders tampoco lo ven — el sistema notifica a la familia.
+- **Serializers públicos exponen SOLO:** nombre, zona, edad aprox, estado, última vez visto, links a fuentes. **Nunca** `contacto`, cédula cruda, identidad de responder ni `face_embedding`. Nunca un endpoint de volcado masivo de fotos/embeddings.
+- **`fallecido` requiere corroboración.** Institución verificada + segundo aporte o fuente oficial. Un solo workspace provisional no puede marcar muertos.
+- **Biometría como último recurso.** Al verificar identidad fuerte: guarda solo el resultado + embedding y descarta la imagen cruda de la cédula.
+- **No somos oficiales.** Decirlo claro; tener ruta de corrección/takedown; minimizar PII pública.
+
+---
+
+## Access rings
+
+- **Lectura pública** (búsqueda) → API key simple + throttling fuerte + privacy filter. Read-only.
+- **Ingesta** (fuentes cooperantes) → token por fuente.
+- **Acciones de responder** → JWT (`simplejwt`) + gate por rol.
+
+API versionada `/api/v1/` desde el día uno.
+
+---
 
 ## Conventions
 
-- Project language is **Spanish** — plan, README, table/column names (`registros_fuente`, `personas_canonicas`, `nombre_norm`, etc.) and domain vocabulary are Spanish. Match it.
-- Build by **Fase 0 first** (per the plan §12): canonical schema + connectors for the 2 big sources + cédula/text dedup + read-only unified search with link-back. That alone resolves ~70% of the pain.
+- **Idioma del proyecto: español** — plan, README, nombres de tabla/columna (`registros_fuente`, `personas_canonicas`, `nombre_norm`) y vocabulario de dominio. Siempre en español.
+- `registros_fuente.nombre_norm` es una STORED generated column. Postgres exige funciones IMMUTABLE allí; `unaccent()` es STABLE → la migración `personas/0001_extensions.py` crea `immutable_unaccent()`. No reemplazar por `unaccent()` directo o las migraciones se rompen.
+- `cedula_norm` usa `regexp_replace(..., '\D', '', 'g')` que sí es IMMUTABLE en Postgres — sin wrapper.
+
+---
 
 ## Commands
 
-The Django backend lives in `apps/api/`. All `manage.py` commands need the DB/Redis
-env vars loaded; source `infra/.env` first (it carries the host ports — they default
-to 5432/6379 but the committed `.env.example` may have been overridden locally if those
-ports were taken).
+El backend Django vive en `apps/api/`. El compose levanta todo el stack (db + redis + api).
 
 ```bash
-# 1. Infra: Postgres (pgvector) + Redis. Only DB + broker; the API runs locally.
-cd infra && cp -n .env.example .env && docker compose up -d && cd ..
+# Stack completo (db + redis + api con hot-reload)
+cd infra && docker compose up -d
 
-# 2. Python env (base deps only; the InsightFace face stack is requirements-faces.txt,
-#    deferred until the `identidad` milestone — heavy ONNX build, not needed yet).
+# Solo infra (db + redis), API local:
+cd infra && docker compose up -d db redis
+
+# Migraciones y comandos dentro del contenedor:
+docker compose exec api python manage.py migrate
+docker compose exec api python manage.py test
+docker compose exec api python manage.py ingesta_consolidador --archivo /tmp/todos_registros.json
+
+# Copiar un archivo al contenedor:
+docker cp /ruta/local/archivo.json reencuentro_api:/tmp/archivo.json
+
+# Alternativa local (sin Docker para la API):
 python3 -m venv apps/api/.venv
 apps/api/.venv/bin/pip install -r apps/api/requirements.txt -r apps/api/requirements-dev.txt
-
-# From apps/api/, load env once per shell, then run manage.py:
 cd apps/api && set -a && . ../../infra/.env && set +a
+apps/api/.venv/bin/python manage.py migrate
+apps/api/.venv/bin/python manage.py runserver
 
-apps/api/.venv/bin/python manage.py migrate          # apply migrations
-apps/api/.venv/bin/python manage.py runserver         # dev server → http://127.0.0.1:8000
-apps/api/.venv/bin/python manage.py test              # run the test suite
-apps/api/.venv/bin/python manage.py makemigrations --check --dry-run   # CI: fail on model drift
-apps/api/.venv/bin/ruff check apps/api                # lint + import order
+# Lint:
+apps/api/.venv/bin/ruff check apps/api
+# CI (falla si hay drift de modelos):
+apps/api/.venv/bin/python manage.py makemigrations --check --dry-run
 ```
 
-Key URLs (under `/api/v1/`): `personas/` (public search), `schema/` (OpenAPI),
-`docs/` (Swagger UI), `redoc/`.
-
-> **Schema note:** `registros_fuente.nombre_norm` is a STORED generated column. Postgres
-> requires IMMUTABLE functions there, but `unaccent()` is STABLE — so migration
-> `personas/0001_extensions.py` creates an `immutable_unaccent()` wrapper. Don't replace it
-> with bare `unaccent()` or migrations break. (Also why the public search filter uses the
-> `__unaccent` lookup — accent-insensitive search is the whole point.)
+**URLs clave** (bajo `/api/v1/`):
+- `personas/` — buscador público
+- `registros/` — registros fuente (en construcción)
+- `schema/` — OpenAPI JSON
+- `docs/` — Swagger UI
+- `redoc/` — ReDoc
