@@ -100,7 +100,10 @@ class PrivacidadPublicaTests(APITestCase):
         data = PersonaCanonicaSerializer(self.persona, context={"request": request}).data
         self.assertEqual(
             set(data.keys()),
-            {"url", "nombre_display", "zona", "estado_actual", "foto_principal", "n_fuentes", "updated_at"},
+            {
+                "url", "nombre", "zona", "estado", "foto_principal", "n_fuentes",
+                "edad_aprox", "ultima_vez_visto", "fuentes", "updated_at",
+            },
         )
 
     # --- registros/ --------------------------------------------------------------
@@ -119,11 +122,15 @@ class PrivacidadPublicaTests(APITestCase):
 
     def test_lista_personas_expone_campos_publicos(self):
         item = self.client.get(LISTA_PERSONAS).json()["results"][0]
-        self.assertEqual(item["nombre_display"], "María Pérez")
+        self.assertEqual(item["nombre"], "María Pérez")
         self.assertEqual(item["zona"], "Carabobo")
-        self.assertEqual(item["estado_actual"], "encontrado_vivo")
+        self.assertEqual(item["estado"], "encontrado_vivo")
+        self.assertEqual(item["edad_aprox"], "30-39")
+        self.assertIsNotNone(item["ultima_vez_visto"])
         self.assertIn("url", item)
         self.assertIn("n_fuentes", item)
+        self.assertEqual(item["fuentes"][0]["fuente"], "dtv")
+        self.assertEqual(item["fuentes"][0]["url_origen"], "https://desaparecidos.example/abc-123")
 
     def test_detalle_persona_expande_registros_inline(self):
         data = self.client.get(f"{LISTA_PERSONAS}{self.persona.id}/").json()
@@ -138,7 +145,7 @@ class PrivacidadPublicaTests(APITestCase):
         data = self.client.get(f"{LISTA_REGISTROS}{self.registro.id}/").json()
         self.assertIn("persona", data)
         self.assertIsNotNone(data["persona"])
-        self.assertEqual(data["persona"]["nombre_display"], "María Pérez")
+        self.assertEqual(data["persona"]["nombre"], "María Pérez")
 
     def test_filtros_busqueda_personas(self):
         self.assertEqual(self.client.get(f"{LISTA_PERSONAS}?nombre=maría").json()["count"], 1)
