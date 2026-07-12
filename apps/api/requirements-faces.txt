@@ -1,0 +1,10 @@
+# Stack de reconocimiento facial (plan §10). Pesado: compila/descarga modelos ONNX.
+# Solo lo necesita la app `identidad` (caras + pgvector + phash), aún no construida.
+# Instalar SOLO cuando se trabaje ese hito:
+#   .venv/bin/pip install -r requirements.txt -r requirements-faces.txt
+#
+# imagehash (pHash, "misma foto") ya está en requirements.txt porque es liviano y
+# lo usa el dedup; aquí va únicamente el embedding de cara.
+
+insightface==0.7.3
+onnxruntime>=1.18

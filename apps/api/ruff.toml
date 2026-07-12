@@ -1,0 +1,9 @@
+# Lint + ordenamiento de imports para apps/api.
+line-length = 100
+target-version = "py312"
+
+exclude = ["migrations", ".venv"]
+
+[lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear.
+select = ["E", "W", "F", "I", "UP", "B"]
